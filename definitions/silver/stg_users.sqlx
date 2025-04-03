@@ -1,0 +1,215 @@
+config { 
+    type: "table",
+    schema: constants.DATAFORM_LV2,
+    description: "Stage table for GA user data.",
+    tags: ["daily-update", "gold"],
+    bigquery: {
+        partitionBy: "date",
+        clusterBy: ["user_pseudo_id"],
+        labels: {environment: "gold"}
+    },
+    columns:{
+        date: "Start date of the session.",
+        table_suffix: "Date suffix. Used primarily to manage updates in partitions.",
+        user_id: "User pseudo ID straight from raw GA4 data.", 
+    }
+}
+
+-- Extracting Orders
+WITH base AS (
+SELECT * FROM  ${ref("src_user_timeline")}
+),
+
+-- Get other user_ids
+other_ids AS (
+SELECT 
+  *
+FROM ${ref("src_user_ids")}
+),
+
+join_other_ids AS(
+SELECT 
+  a.*,
+  b.user_ids
+  FROM base AS a
+  LEFT JOIN other_ids AS b
+  ON a.user_pseudo_id = b.user_pseudo_id
+),
+
+-- add custom cohorts
+add_cohorts AS (
+ SELECT 
+  *,
+  CASE 
+    WHEN purchaser IS FALSE AND engaged_flag IS FALSE THEN 1
+    WHEN purchaser IS FALSE AND engaged_flag IS TRUE THEN 2
+    
+    WHEN purchaser IS TRUE AND repeat_purchaser IS FALSE AND returned_home_5d_plus IS FALSE THEN 3
+    WHEN purchaser IS TRUE AND repeat_purchaser IS FALSE AND returned_home_5d_plus IS TRUE AND engaged_flag IS FALSE THEN 4
+    WHEN purchaser IS TRUE AND repeat_purchaser IS FALSE AND returned_home_5d_plus IS TRUE AND engaged_flag IS TRUE THEN 5
+
+    WHEN purchaser IS TRUE AND repeat_purchaser IS TRUE AND returned_home_5d_plus IS TRUE AND engaged_flag IS FALSE THEN 8
+    WHEN purchaser IS TRUE AND repeat_purchaser IS TRUE AND returned_home_5d_plus IS TRUE AND engaged_flag IS TRUE THEN 7
+    WHEN purchaser IS TRUE AND repeat_purchaser IS TRUE THEN 6
+  ELSE 0 END AS cohort
+ FROM join_other_ids
+),
+
+-- -- add last users cohort
+add_last_cohort_raw AS (
+SELECT 
+  *, 
+  LAST_VALUE(cohort) OVER (PARTITION BY user_pseudo_id ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS previous_cohort
+FROM add_cohorts
+),
+
+-- cohort change rolling window
+add_cohort_windows AS (
+SELECT
+  *,
+  SUM(CASE WHEN cohort 
+  <> previous_cohort THEN 1 ELSE 0 END) OVER (PARTITION BY user_pseudo_id ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cohort_change_window
+FROM add_last_cohort_raw
+),
+
+-- add last cohort
+add_last_cohort AS (
+SELECT 
+  * EXCEPT(previous_cohort),
+  FIRST_VALUE(previous_cohort) OVER (PARTITION BY user_pseudo_id, cohort_change_window ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS previous_cohort
+FROM add_cohort_windows
+),
+
+-- calculate min and max timestamp for each user and cohort change window
+cohort_time_diff AS (
+SELECT 
+    user_pseudo_id,
+    cohort_change_window,
+    MIN(session_timestamp) AS first_session_timestamp,
+    MAX(session_timestamp) AS last_session_timestamp
+FROM add_last_cohort
+GROUP BY ALL
+),
+
+-- join back to main table and calculate difference to get duration of days
+add_cohort_days AS (
+  SELECT 
+    a.*, 
+    b.first_session_timestamp,
+    b.last_session_timestamp,
+    TIMESTAMP_DIFF(b.last_session_timestamp, b.first_session_timestamp, DAY)+1 AS cohort_duration_days
+FROM add_last_cohort AS a
+LEFT JOIN cohort_time_diff AS b
+    ON a.user_pseudo_id = b.user_pseudo_id 
+    AND a.cohort_change_window = b.cohort_change_window
+),
+
+add_last_daily_cohort AS (
+SELECT    
+  *  ,
+  LAST_VALUE(cohort) OVER (PARTITION BY date, user_pseudo_id ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS last_daily_cohort
+  FROM add_cohort_days
+),
+
+add_first_daily_cohort AS (
+SELECT    
+  * , 
+  FIRST_VALUE(cohort) OVER (PARTITION BY date, user_pseudo_id ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS first_daily_cohort, 
+  FROM add_last_daily_cohort
+),
+
+-- Join previous day's cohort back in
+distinct_prev_day_cohort AS (
+SELECT 
+  date,
+  user_pseudo_id,
+  LAG(last_daily_cohort) OVER (PARTITION BY user_pseudo_id ORDER BY date) AS last_daily_cohort_prev_day, 
+FROM add_first_daily_cohort
+GROUP BY date, user_pseudo_id, last_daily_cohort
+--QUALIFY ROW_NUMBER() OVER (PARTITION BY user_pseudo_id ORDER BY session_timestamp) = 1
+),
+
+join_prev_day_cohort AS (
+SELECT
+  a.*,
+  b.last_daily_cohort_prev_day
+FROM add_first_daily_cohort AS a 
+LEFT JOIN distinct_prev_day_cohort AS b
+  ON a.user_pseudo_id = b.user_pseudo_id
+  AND a.date = b.date
+),
+
+cohort_counts AS (
+SELECT
+  user_pseudo_id,
+  DATE(session_timestamp) AS date,
+  cohort,
+  COUNT(*) AS cohort_count,
+FROM join_prev_day_cohort
+GROUP BY user_pseudo_id, date, cohort
+),
+
+ranked_cohorts AS (
+SELECT *,  -- tie-breaker for highest cohort
+  ROW_NUMBER() OVER (PARTITION BY user_pseudo_id, date ORDER BY cohort_count DESC, cohort DESC) AS rn
+FROM cohort_counts
+),
+
+best_cohort AS (
+SELECT
+  user_pseudo_id,
+  date,
+  cohort AS top_daily_cohort,
+  cohort_count
+FROM ranked_cohorts
+WHERE rn = 1),
+
+join_top_cohort AS (
+  SELECT 
+  a.*,
+  b.top_daily_cohort as top_daily_cohort,
+  b.cohort_count as cohort_count,
+FROM join_prev_day_cohort AS a
+LEFT JOIN best_cohort AS b
+ON 
+  a.date = b.date 
+    AND a.user_pseudo_id = b.user_pseudo_id
+),
+
+scored_changes AS (
+  SELECT
+    *,
+    CASE 
+      WHEN previous_cohort IS NULL THEN 0
+      WHEN cohort > previous_cohort THEN 1
+      WHEN cohort < previous_cohort THEN -1
+      ELSE 0
+    END AS cohort_shift
+  FROM join_top_cohort
+),
+
+calculate_shifts AS (SELECT
+  *,
+  COUNT(*) AS total_sessions,
+  COUNTIF(cohort_shift > 0) AS positive_changes,
+  COUNTIF(cohort_shift < 0) AS negative_changes,
+  SUM(cohort_shift) AS net_cohort_shift,
+  AVG(cohort_shift) AS avg_shift_per_session
+FROM scored_changes
+GROUP BY ALL
+),
+
+pick_top_worst_channel AS (
+SELECT
+  *,
+  FIRST_VALUE(channel) OVER user_day_window AS top_daily_channel_push, 
+  LAST_VALUE(channel) OVER user_day_window AS top_daily_channel_retreat, 
+FROM calculate_shifts
+WINDOW user_day_window AS (PARTITION BY date, user_pseudo_id ORDER BY net_cohort_shift, pageviews DESC)
+)
+
+-- final query
+SELECT 
+  * EXCEPT(bounced_session),
+  CASE WHEN pageviews = 0 and bounced_session = 0 THEN 1 ELSE bounced_session END AS bounced_session
+FROM pick_top_worst_channel

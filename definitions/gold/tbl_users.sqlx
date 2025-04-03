@@ -1,0 +1,109 @@
+config { 
+    type: "table",
+    schema: constants.DATAFORM_LV3,
+    description: "PRS table for GA user data.",
+    tags: ["daily-update", "gold"],
+    bigquery: {
+        partitionBy: "date",
+        labels: {environment: "gold"}
+    },
+    columns:{
+        date: "Start date of the session.",
+        table_suffix: "Date suffix. Used primarily to manage updates in partitions.",
+        user_id: "User pseudo ID straight from raw GA4 data.", 
+    }
+}
+
+js {var{get_cohort_name} = require("includes/cohorts_udf");}
+
+WITH
+replace_cohorts_with_names AS (
+SELECT
+    * EXCEPT(cohort, previous_cohort, last_daily_cohort, first_daily_cohort, last_daily_cohort_prev_day, top_daily_cohort),
+     ${get_cohort_name("cohort")} AS cohort,
+     ${get_cohort_name("previous_cohort")} AS previous_cohort,
+     ${get_cohort_name("last_daily_cohort")} AS last_daily_cohort,
+     ${get_cohort_name("first_daily_cohort")} AS first_daily_cohort,
+     ${get_cohort_name("last_daily_cohort_prev_day")} AS last_daily_cohort_prev_day,
+     ${get_cohort_name("top_daily_cohort")} AS top_daily_cohort,
+FROM ${ref("stg_users")}  
+),
+
+-- arrange columns and shit like that
+arrange_columns AS (
+  SELECT 
+  date,
+  user_pseudo_id,
+    'On The Beach' AS brand,
+    STRUCT(
+      user_ids AS ga4_user_ids,
+      order_codes AS order_codes) AS ids,
+  STRUCT(
+      session_id,
+      session_timestamp,
+      website_version) AS session,
+  STRUCT(
+      channel,
+      first_daily_channel,
+      last_daily_channel,
+      CASE WHEN previous_last_daily_channel IS NULL THEN 'Unknown' ELSE previous_last_daily_channel END AS previous_last_daily_channel,
+      top_daily_channel_push,
+      top_daily_channel_retreat
+      ) AS channel,
+  STRUCT(
+      order_count,
+      profit,
+      revenue,
+      return_dates,
+      departure_dates) AS orders,
+   STRUCT(   
+      rolling_order_window AS order_window,
+      first_order_window AS lag_order_window,
+      CASE WHEN first_order_window = total_order_count THEN NULL ELSE first_channel_order_window END AS first_channel_order_window,
+      CASE WHEN first_order_window = total_order_count THEN NULL ELSE last_channel_order_window END AS last_channel_order_window,
+      CASE WHEN first_order_window = total_order_count THEN NULL ELSE order_channel_path END AS purchase_channel_path,
+      CASE WHEN first_order_window = total_order_count THEN NULL ELSE session_count END AS sessions_in_order_window,
+      CASE WHEN first_order_window = total_order_count THEN NULL ELSE orders_window_days END AS order_window_days
+      ) AS order_window,
+  STRUCT(
+      cohort,
+      cohort_change_window,
+      CASE 
+        WHEN first_visit_events = 1 THEN '0. Unknown'
+        WHEN previous_cohort IS NULL THEN cohort
+      ELSE previous_cohort END AS previous_cohort,
+      first_daily_cohort,
+      last_daily_cohort,
+      last_daily_cohort_prev_day,
+      top_daily_cohort,
+      cohort_duration_days) AS cohort,
+  STRUCT(
+      engaged_flag,
+      has_engaged_session_last_30_days AS engaged_session_30days,
+      has_engaged_session_last_90_days AS engaged_session_90days,
+      has_engaged_session_last_365_days AS engaged_session_365days,
+      has_engaged_crm_last_30_days AS engaged_crm_30days,
+      has_engaged_crm_last_90_days AS engaged_crm_90days,
+      has_engaged_crm_last_365_days AS engaged_crm_365days) AS engage,
+  STRUCT(
+      purchaser,
+      repeat_purchaser,
+      returned_home_5d_plus AS returned_home_5days_plus,
+      purchased_last_30d AS purchased_last_30days,
+      purchased_last_90d AS purchased_last_90days,
+      purchased_last_12m AS purchased_last_365days
+      ) AS purchase,
+  STRUCT(
+      bounced_session AS bounced_sessions,
+      pageviews,
+      landing_pageviews,
+      create_account_events AS signups,
+      login_events AS logins,
+      first_visit_events AS first_visits,
+      deal_search_events AS deal_searches
+      ) AS metrics,
+FROM replace_cohorts_with_names
+)
+
+-- final query
+SELECT * FROM arrange_columns

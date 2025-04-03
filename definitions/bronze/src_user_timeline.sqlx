@@ -1,0 +1,304 @@
+config { 
+    type: "table",
+    schema: constants.DATAFORM_LV1,
+    description: "Stage for GA user data.",
+    tags: ["daily-update", "silver"],
+    bigquery: {
+        labels: {environment: "silver"}
+    },
+}
+
+-- Extracting Orders
+WITH source_orders AS (
+  SELECT
+    order_code,
+    departure_date,
+    gross_margin AS profit,
+    gross_revenue AS revenue,
+    TIMESTAMP_ADD(departure_date, INTERVAL duration DAY) AS return_date,
+    duration,
+  FROM ${ref("tbl_orders")}
+  WHERE
+    CurrentVersionInd IS TRUE
+    AND country_code IN('GB')
+    AND brand IN ('On The Beach')
+    AND calculatedbookingstatus NOT IN ('CANCELLED', 'DROPPED')
+    AND test_booking_ind IS NOT TRUE
+    AND date >= '2023-06-01'
+),
+
+-- Extracting Sessions
+sessions_all AS (
+  SELECT 
+    date,
+    user_id AS user_pseudo_id,
+    session_id,
+    website_version,
+    order_code,
+    TIMESTAMP_TRUNC(session_start, SECOND) AS session_timestamp,
+    session_start,
+    channel,
+    order_count,
+    pageviews,
+    landing_pageviews,
+    create_account_events,
+    login_events,
+    CASE WHEN ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY session_start ASC) = 1 THEN 1 ELSE 0 END AS first_visit_events,
+    deal_search_events,
+    bounced_session
+  FROM ${ref("tbl_sessions")}
+  LEFT JOIN UNNEST(SPLIT(order_codes,",")) AS order_code
+  WHERE market = 'On The Beach'
+  AND ga_platform = 'GA4'
+  AND date >= '2023-06-01'
+  GROUP BY ALL  
+),
+
+-- Combining the two to pull in return holiday dates, profit and revenue
+full_data AS (
+  SELECT
+    a.date,
+    a.session_timestamp,
+    a.user_pseudo_id,
+    a.session_id,
+    a.channel,
+    a.website_version,
+    a.order_code,
+    a.order_count,
+    a.bounced_session,
+    a.pageviews,
+    a.landing_pageviews,
+    a.create_account_events,
+    a.login_events,
+    a.first_visit_events,
+    a.deal_search_events,
+  -- Joined order data
+    b.departure_date,
+    b.duration,
+    b.return_date,
+    b.profit,
+    b.revenue
+  FROM sessions_all a
+  LEFT JOIN source_orders b
+  ON a.order_code = b.order_code
+),
+
+-- Flatten out the duplicate order codes in a session, and take the sums/max across multiple order codes, add order window.
+full_data_flat AS (
+  SELECT
+  -- Groups
+    date,
+    user_pseudo_id,
+    session_id,
+    channel,
+    session_timestamp,
+    MAX(website_version) AS website_version,
+    STRING_AGG(order_code, ', ') AS order_codes,
+  -- Calculations
+    SUM(CASE WHEN SUM(order_count) > 0 THEN SUM(order_count) ELSE 0 END) OVER (PARTITION BY user_pseudo_id ORDER BY session_timestamp) AS rolling_order_window,
+    MAX(order_count) AS order_count,
+    MAX(bounced_session) AS bounced_session,
+    SUM(pageviews) AS pageviews,
+    SUM(landing_pageviews) AS landing_pageviews,
+    SUM(create_account_events) AS create_account_events,
+    MAX(login_events) AS login_events,
+    MAX(first_visit_events) AS first_visit_events,
+    SUM(deal_search_events) AS deal_search_events,
+    MAX(departure_date) AS departure_date,
+    MAX(duration) AS duration,
+    MAX(return_date) AS return_date,
+    SUM(profit) AS profit,
+    SUM(revenue) AS revenue
+  FROM full_data  
+  GROUP BY date, user_pseudo_id, session_id, channel, session_timestamp
+),
+
+-- Add first order window lag because some metrics use a pre-purchase window, some a post-purchase window
+window_lag AS (
+  SELECT 
+    *,
+     LAG(rolling_order_window, 1, 0) OVER (PARTITION BY user_pseudo_id ORDER BY session_timestamp) AS first_order_window
+  FROM full_data_flat  
+),
+
+-- CHANNEL PURCHASE PATHS FOR A USER
+-- Get previous channel in the order window
+previous_channel AS (
+  SELECT
+    user_pseudo_id,
+    session_timestamp,
+    channel,
+    first_order_window,
+    LAG(channel) OVER (PARTITION BY user_pseudo_id, first_order_window ORDER BY session_timestamp) AS prev_channel
+  FROM window_lag
+),
+
+-- Remove duplicate channels, so if a user hits email twice, it will only count once.
+dedupe AS (
+SELECT 
+  user_pseudo_id,
+  first_order_window,
+  STRING_AGG(channel, ' / ' ORDER BY session_timestamp) AS ordered_channels
+FROM previous_channel
+WHERE channel != prev_channel OR prev_channel IS NULL  -- Remove consecutive duplicates
+GROUP BY ALL
+),
+
+-- joine back to the user and their order window
+join_dedupe_to_main_branch AS (
+  SELECT 
+    a.*,
+    b.ordered_channels AS order_channel_path
+  FROM window_lag AS a
+  LEFT JOIN dedupe AS b
+    ON a.user_pseudo_id = b.user_pseudo_id
+    AND a.first_order_window = b.first_order_window
+),
+
+-- WINDOW CALCULATIONS
+-- Bring in all the user window calculations
+window_calculations AS (
+  SELECT 
+    *,
+    COUNT(DISTINCT session_id) OVER (PARTITION BY user_pseudo_id, first_order_window) AS session_count,
+    DATE_DIFF(
+      LAST_VALUE(session_timestamp) OVER (PARTITION BY user_pseudo_id, first_order_window ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),
+      FIRST_VALUE(session_timestamp) OVER (PARTITION BY user_pseudo_id, first_order_window ORDER BY session_timestamp), DAY) AS orders_window_days,
+    CASE WHEN bounced_session <> 1 AND (deal_search_events >= 1 OR pageviews > 2 OR login_events > 0 OR create_account_events > 0 OR order_count > 0) THEN TRUE ELSE FALSE END AS engaged_flag, -- Engaged session flag
+    LAST_VALUE(channel) OVER (PARTITION BY user_pseudo_id, first_order_window
+      ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS last_channel_order_window,
+    FIRST_VALUE(channel) OVER (PARTITION BY user_pseudo_id, first_order_window
+      ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS first_channel_order_window,
+    SUM(order_count) OVER (PARTITION BY user_pseudo_id) AS total_order_count,
+    MAX(duration) OVER (PARTITION BY user_pseudo_id, rolling_order_window) AS last_duration,
+    MAX(return_date) OVER (PARTITION BY user_pseudo_id, rolling_order_window) AS last_return_date,
+    MAX(CASE WHEN order_count > 0 THEN session_timestamp END) OVER (PARTITION BY user_pseudo_id, rolling_order_window) AS last_purchase_date,
+    MAX(CASE WHEN bounced_session = 0 THEN session_timestamp END) OVER (PARTITION BY user_pseudo_id, rolling_order_window) AS last_engaged_session_date,
+    CASE WHEN (SUM(order_count) OVER (PARTITION BY user_pseudo_id, rolling_order_window)) > 0 THEN TRUE ELSE FALSE END AS purchaser, -- Has purchased ever
+    CASE WHEN (MAX(rolling_order_window) OVER (PARTITION BY user_pseudo_id, rolling_order_window)) > 1 THEN TRUE ELSE FALSE END AS repeat_purchaser, -- Is a repeat purchaser
+  FROM join_dedupe_to_main_branch
+  GROUP BY ALL
+),
+
+-- New CTE branch to get an array of all return dates by user_pseudo_id
+    return_date_array AS (
+    SELECT 
+      user_pseudo_id, 
+      ARRAY_AGG(return_date ORDER BY return_date) AS future_return_dates_array
+    FROM window_calculations
+    WHERE return_date IS NOT NULL
+    GROUP BY user_pseudo_id
+    ),
+
+    -- New CTE branch to get an array of all return dates by user_pseudo_id
+    departure_date_array AS (
+    SELECT 
+      user_pseudo_id, 
+      ARRAY_AGG(departure_date ORDER BY departure_date) AS future_departure_dates_array
+    FROM window_calculations
+    WHERE return_date IS NOT NULL
+    GROUP BY user_pseudo_id
+    ),
+
+-- Join back to the main table, but only when the session timestamp is 30+ days after the last return date
+check_return_dates AS (
+SELECT 
+  a.*, 
+  ARRAY_TO_STRING(ARRAY(SELECT CAST(dt AS STRING) FROM UNNEST(b.future_return_dates_array) AS dt), ', ') AS return_dates,
+  ARRAY_TO_STRING(ARRAY(SELECT CAST(dt AS STRING) FROM UNNEST(c.future_departure_dates_array) AS dt), ', ') AS departure_dates,
+   (
+    SELECT MAX(return_timestamp)
+    FROM UNNEST(future_return_dates_array) AS return_timestamp
+    WHERE return_timestamp < session_timestamp) AS last_return_before_session,
+  IF (
+    session_timestamp >= TIMESTAMP_ADD((
+      SELECT MAX(return_timestamp)
+      FROM UNNEST(future_return_dates_array) AS return_timestamp
+      WHERE return_timestamp < session_timestamp),INTERVAL 5 DAY),TRUE,FALSE) AS returned_home_5d_plus
+FROM window_calculations AS a
+LEFT JOIN return_date_array AS b
+  ON a.user_pseudo_id = b.user_pseudo_id
+LEFT JOIN departure_date_array AS c
+  ON a.user_pseudo_id = c.user_pseudo_id
+),
+
+-- add various daily channel calculations
+first_last_daily_channel AS (
+SELECT * FROM (
+  SELECT
+    date,
+    user_pseudo_id,
+    LAST_VALUE(channel) OVER user_day_window AS last_daily_channel,
+    FIRST_VALUE(channel) OVER user_day_window AS first_daily_channel,
+    ROW_NUMBER() OVER user_day_window AS rn
+  FROM check_return_dates
+  WINDOW user_day_window AS (PARTITION BY date, user_pseudo_id ORDER BY session_timestamp 
+  )
+)
+WHERE rn = 1
+),
+
+join_daily_channel AS (
+SELECT
+  a.*,
+  b.last_daily_channel,
+  b.first_daily_channel,
+  FROM check_return_dates AS a
+LEFT JOIN first_last_daily_channel AS b
+  ON a.user_pseudo_id = b.user_pseudo_id
+  AND a.date = b.date
+),
+
+-- you need to remove the wild card from this, make it a grouped cte that joins back to the main one, it's not working over days correctly
+get_prev_daily_channel AS (
+SELECT
+  date,
+  user_pseudo_id,
+  last_daily_channel,
+  LAG(last_daily_channel) OVER (PARTITION BY user_pseudo_id ORDER BY date) AS previous_last_daily_channel
+FROM join_daily_channel
+GROUP BY date, user_pseudo_id, last_daily_channel
+),
+join_prev_channel AS (
+SELECT
+  a.*,
+  b.previous_last_daily_channel
+FROM join_daily_channel AS a
+LEFT JOIN get_prev_daily_channel AS b
+  ON a.date = b.date
+    AND a.user_pseudo_id = b.user_pseudo_id
+),
+
+-- add engaged metrics windows
+add_timebased_calculations AS (
+SELECT 
+  *,
+  CASE -- Has made a purchase in the last 12 months
+  WHEN last_purchase_date BETWEEN TIMESTAMP_SUB(session_timestamp, INTERVAL 365 DAY) AND session_timestamp THEN TRUE ELSE FALSE END AS purchased_last_12m,    
+  CASE -- Has made a purchase in the last 90 days
+  WHEN last_purchase_date BETWEEN TIMESTAMP_SUB(session_timestamp, INTERVAL 90 DAY) AND session_timestamp THEN TRUE ELSE FALSE END AS purchased_last_90d,
+  CASE -- Has made a purchase in the last 30 days
+  WHEN last_purchase_date BETWEEN TIMESTAMP_SUB(session_timestamp, INTERVAL 30 DAY) AND session_timestamp THEN TRUE ELSE FALSE END AS purchased_last_30d,    
+  CASE -- Has engaged session in the last 30 days
+  WHEN (CASE WHEN engaged_flag IS TRUE THEN session_timestamp END)
+    BETWEEN TIMESTAMP_SUB(session_timestamp, INTERVAL 30 DAY) AND session_timestamp THEN TRUE ELSE FALSE END AS has_engaged_session_last_30_days,
+  CASE -- Has engaged session in the last 90 days
+  WHEN (CASE WHEN engaged_flag IS TRUE THEN session_timestamp END)
+    BETWEEN TIMESTAMP_SUB(session_timestamp, INTERVAL 90 DAY) AND session_timestamp THEN TRUE ELSE FALSE END AS has_engaged_session_last_90_days,
+  CASE -- Has engaged session in the last 365 days
+  WHEN (CASE WHEN engaged_flag IS TRUE THEN session_timestamp END)
+    BETWEEN TIMESTAMP_SUB(session_timestamp, INTERVAL 365 DAY) AND session_timestamp THEN TRUE ELSE FALSE END AS has_engaged_session_last_365_days,
+  CASE -- Has engaged crm in the last 30 days
+  WHEN (CASE WHEN engaged_flag IS TRUE AND channel IN ( "Brand - Web Push", "Brand - SMS", "Brand - Mobile Push", "Brand - App Share", "Brand - Whatsapp") THEN session_timestamp END)
+    BETWEEN TIMESTAMP_SUB(session_timestamp, INTERVAL 30 DAY) AND session_timestamp THEN TRUE ELSE FALSE END AS has_engaged_crm_last_30_days,
+  CASE -- Has engaged crm in the last 90 days
+  WHEN (CASE WHEN engaged_flag IS TRUE AND channel IN ( "Brand - Web Push", "Brand - SMS", "Brand - Mobile Push", "Brand - App Share", "Brand - Whatsapp") THEN session_timestamp END)
+    BETWEEN TIMESTAMP_SUB(session_timestamp, INTERVAL 90 DAY) AND session_timestamp THEN TRUE ELSE FALSE END AS has_engaged_crm_last_90_days,
+  CASE -- Has engaged crm in the last 365 days
+  WHEN (CASE WHEN engaged_flag IS TRUE AND channel IN ( "Brand - Web Push", "Brand - SMS", "Brand - Mobile Push", "Brand - App Share", "Brand - Whatsapp") THEN session_timestamp END)
+    BETWEEN TIMESTAMP_SUB(session_timestamp, INTERVAL 365 DAY) AND session_timestamp THEN TRUE ELSE FALSE END AS has_engaged_crm_last_365_days
+FROM join_prev_channel
+)
+
+-- final query
+SELECT * FROM add_timebased_calculations
