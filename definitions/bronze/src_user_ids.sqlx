@@ -20,6 +20,7 @@ other_ids AS (
 SELECT 
   DISTINCT user_pseudo_id, user_id, brand
 FROM ${ref("src_ga4_events_combined")}
+WHERE brand = 'OTB UK'
 ),
 
 other_ids_agg AS (

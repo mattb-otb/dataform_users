@@ -25,6 +25,7 @@ other_ids AS (
 SELECT 
   *
 FROM ${ref("src_user_ids")}
+WHERE brand = 'OTB UK'
 ),
 
 join_other_ids AS(
@@ -36,6 +37,27 @@ SELECT
   ON a.user_pseudo_id = b.user_pseudo_id
 ),
 
+-- flag for purchase days, so new and repeat customer are always flagged across every session that day
+purchase_daily_flag AS (
+SELECT
+  date,
+  user_pseudo_id,
+  TRUE AS daily_purchase_flag
+FROM join_other_ids  
+WHERE order_count > 0
+GROUP by date, user_pseudo_id, daily_purchase_flag
+),
+
+join_daily_purchase_flag AS (
+SELECT
+  a.*,
+  CAST(COALESCE(b.daily_purchase_flag,FALSE) AS BOOL) AS daily_purchase_flag
+FROM join_other_ids AS a
+  LEFT JOIN purchase_daily_flag AS b
+    ON a.user_pseudo_id = b.user_pseudo_id
+      AND a.date = b.date
+),
+
 -- add custom cohorts
 add_cohorts AS (
  SELECT 
@@ -43,16 +65,18 @@ add_cohorts AS (
   CASE 
     WHEN purchaser IS FALSE AND engaged_flag IS FALSE THEN 1
     WHEN purchaser IS FALSE AND engaged_flag IS TRUE THEN 2
-    
+    WHEN purchaser IS TRUE AND repeat_purchaser IS FALSE AND daily_purchase_flag IS TRUE THEN 3
     WHEN purchaser IS TRUE AND repeat_purchaser IS FALSE AND returned_home_5d_plus IS FALSE THEN 3
     WHEN purchaser IS TRUE AND repeat_purchaser IS FALSE AND returned_home_5d_plus IS TRUE AND engaged_flag IS FALSE THEN 4
     WHEN purchaser IS TRUE AND repeat_purchaser IS FALSE AND returned_home_5d_plus IS TRUE AND engaged_flag IS TRUE THEN 5
+    
+    WHEN repeat_purchaser IS TRUE AND daily_purchase_flag IS TRUE THEN 6   
+    WHEN repeat_purchaser IS TRUE AND returned_home_5d_plus IS FALSE THEN 6
+    WHEN repeat_purchaser IS TRUE AND returned_home_5d_plus IS TRUE AND engaged_flag IS FALSE THEN 4.5
+    WHEN repeat_purchaser IS TRUE AND returned_home_5d_plus IS TRUE AND engaged_flag IS TRUE THEN 5.5
 
-    WHEN purchaser IS TRUE AND repeat_purchaser IS TRUE AND returned_home_5d_plus IS TRUE AND engaged_flag IS FALSE THEN 8
-    WHEN purchaser IS TRUE AND repeat_purchaser IS TRUE AND returned_home_5d_plus IS TRUE AND engaged_flag IS TRUE THEN 7
-    WHEN purchaser IS TRUE AND repeat_purchaser IS TRUE THEN 6
   ELSE 0 END AS cohort
- FROM join_other_ids
+ FROM join_daily_purchase_flag
 ),
 
 -- -- add last users cohort
@@ -126,7 +150,6 @@ SELECT
   LAG(last_daily_cohort) OVER (PARTITION BY user_pseudo_id ORDER BY date) AS last_daily_cohort_prev_day, 
 FROM add_first_daily_cohort
 GROUP BY date, user_pseudo_id, last_daily_cohort
---QUALIFY ROW_NUMBER() OVER (PARTITION BY user_pseudo_id ORDER BY session_timestamp) = 1
 ),
 
 join_prev_day_cohort AS (
@@ -139,38 +162,26 @@ LEFT JOIN distinct_prev_day_cohort AS b
   AND a.date = b.date
 ),
 
-cohort_counts AS (
+top_cohort AS (
 SELECT
-  user_pseudo_id,
-  DATE(session_timestamp) AS date,
-  cohort,
-  COUNT(*) AS cohort_count,
-FROM join_prev_day_cohort
-GROUP BY user_pseudo_id, date, cohort
-),
-
-ranked_cohorts AS (
-SELECT *,  -- tie-breaker for highest cohort
-  ROW_NUMBER() OVER (PARTITION BY user_pseudo_id, date ORDER BY cohort_count DESC, cohort DESC) AS rn
-FROM cohort_counts
-),
-
-best_cohort AS (
-SELECT
-  user_pseudo_id,
   date,
-  cohort AS top_daily_cohort,
-  cohort_count
-FROM ranked_cohorts
-WHERE rn = 1),
+  user_pseudo_id,
+  MAX(cohort) AS top_daily_cohort,
+  COUNT(*) AS cohort_count
+FROM join_prev_day_cohort
+GROUP BY date, user_pseudo_id
+),
 
 join_top_cohort AS (
   SELECT 
   a.*,
-  b.top_daily_cohort as top_daily_cohort,
+  CASE 
+  WHEN cohort = 3 THEN 3
+  WHEN cohort = 6 THEN 6
+  ELSE b.top_daily_cohort END AS top_daily_cohort,
   b.cohort_count as cohort_count,
 FROM join_prev_day_cohort AS a
-LEFT JOIN best_cohort AS b
+LEFT JOIN top_cohort AS b
 ON 
   a.date = b.date 
     AND a.user_pseudo_id = b.user_pseudo_id
@@ -193,7 +204,6 @@ calculate_shifts AS (SELECT
   COUNT(*) AS total_sessions,
   COUNTIF(cohort_shift > 0) AS positive_changes,
   COUNTIF(cohort_shift < 0) AS negative_changes,
-  SUM(cohort_shift) AS net_cohort_shift,
   AVG(cohort_shift) AS avg_shift_per_session
 FROM scored_changes
 GROUP BY ALL
@@ -205,11 +215,16 @@ SELECT
   FIRST_VALUE(channel) OVER user_day_window AS top_daily_channel_push, 
   LAST_VALUE(channel) OVER user_day_window AS top_daily_channel_retreat, 
 FROM calculate_shifts
-WINDOW user_day_window AS (PARTITION BY date, user_pseudo_id ORDER BY net_cohort_shift, pageviews DESC)
-)
+WINDOW user_day_window AS (PARTITION BY date, user_pseudo_id ORDER BY cohort_shift, pageviews DESC)
+),
 
 -- final query
-SELECT 
-  * EXCEPT(bounced_session),
+final AS (SELECT 
+  * EXCEPT(bounced_session, top_daily_channel_push, top_daily_channel_retreat),
+  CASE WHEN positive_changes = 0 THEN NULL ELSE top_daily_channel_push END AS top_daily_channel_push,
+  CASE WHEN negative_changes = 0 THEN NULL ELSE top_daily_channel_retreat END AS top_daily_channel_retreat,
   CASE WHEN pageviews = 0 and bounced_session = 0 THEN 1 ELSE bounced_session END AS bounced_session
 FROM pick_top_worst_channel
+)
+
+SELECT * FROM final

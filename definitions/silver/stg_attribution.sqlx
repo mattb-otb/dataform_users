@@ -1,0 +1,121 @@
+config { 
+    type: "table",
+    schema: constants.DATAFORM_LV2,
+    description: "Stage table for GA user data.",
+    tags: ["daily-update", "gold"],
+    bigquery: {
+        partitionBy: "date",
+        clusterBy: ["user_pseudo_id"],
+        labels: {environment: "gold"}
+    },
+    columns:{
+        date: "Start date of the session.",
+        table_suffix: "Date suffix. Used primarily to manage updates in partitions.",
+        user_id: "User pseudo ID straight from raw GA4 data.", 
+    }
+}
+
+WITH 
+-- add order window row numbers, revenue and order date windows
+add_row_numbers AS (
+SELECT 
+  date,
+  user_pseudo_id,
+  session_timestamp,
+  session_id,
+  order_count,
+  first_order_window,
+  MAX(revenue) OVER (PARTITION BY user_pseudo_id, first_order_window) AS revenue,
+  pageviews,
+  ROW_NUMBER() OVER (PARTITION BY user_pseudo_id, first_order_window ORDER BY session_timestamp ASC) AS rn3,
+  ROW_NUMBER() OVER (PARTITION BY user_pseudo_id, first_order_window ORDER BY session_timestamp DESC) AS rn4,
+FROM ${ref("src_user_timeline")}
+),
+
+-- add ushape column
+add_ushape AS (
+SELECT 
+  *, 
+  ABS(rn3 - rn4) AS ranking
+FROM add_row_numbers
+ORDER BY session_timestamp ASC
+),
+
+-- null the last window
+null_last_window AS (
+SELECT 
+  * EXCEPT(pageviews, rn3, rn4, ranking),
+    CASE WHEN revenue IS NULL THEN NULL ELSE MAX(date) OVER (PARTITION BY user_pseudo_id, first_order_window) END AS order_date, 
+    CASE WHEN revenue IS NULL THEN NULL ELSE pageviews END AS pageviews,
+    CASE WHEN revenue IS NULL THEN NULL ELSE rn3 END AS rn3,
+    CASE WHEN revenue IS NULL THEN NULL ELSE rn4 END AS rn4,
+    CASE WHEN revenue IS NULL THEN NULL ELSE ranking END AS ranking,
+FROM add_ushape
+),
+
+-- calculate rolling counts
+add_rolling_counts AS (
+SELECT 
+  *,
+  MAX(order_count) OVER (PARTITION BY user_pseudo_id, first_order_window) AS order_window,
+  SUM(ranking) OVER (PARTITION BY user_pseudo_id, first_order_window) AS rolling_count_ushape,
+  SUM(pageviews) OVER (PARTITION BY user_pseudo_id, first_order_window) AS rolling_count_pageviews,
+  SUM(rn3) OVER (PARTITION BY user_pseudo_id, first_order_window) AS rolling_count_linear
+FROM null_last_window
+),
+
+-- calculate percentiles
+calculate_percentiles AS (
+SELECT *,
+CASE 
+  WHEN order_count > 0 AND ranking = 0 THEN CAST(1 AS BIGNUMERIC)
+  WHEN order_window = 0 THEN NULL
+  ELSE SAFE_DIVIDE(SAFE_CAST(ranking AS BIGNUMERIC), SAFE_CAST(rolling_count_ushape AS BIGNUMERIC))
+END AS percentile_order_share_ushape,
+  CASE 
+    WHEN order_count > 0 AND rolling_count_pageviews = 0 THEN CAST(1 AS BIGNUMERIC)
+    WHEN order_window = 0 THEN NULL
+    ELSE SAFE_DIVIDE(SAFE_CAST(pageviews AS BIGNUMERIC), SAFE_CAST(rolling_count_pageviews AS BIGNUMERIC))
+  END AS percentile_order_share_pageviews,
+  CASE 
+    WHEN order_window = 0 THEN NULL
+    ELSE SAFE_DIVIDE(SAFE_CAST(rn3 AS BIGNUMERIC), SAFE_CAST(rolling_count_linear AS BIGNUMERIC))
+  END AS percentile_order_share_linear
+FROM add_rolling_counts
+),
+
+add_bignumeric_rownumber AS (
+SELECT
+  *, 
+  CAST(order_window AS BIGNUMERIC) AS order_window_bn,
+  CAST(revenue AS BIGNUMERIC) AS order_revenue_bn
+FROM calculate_percentiles  
+),
+
+-- final calculation
+calculate_percentiles_final AS (
+SELECT 
+  *, 
+  SAFE_MULTIPLY(order_window_bn, percentile_order_share_ushape) AS redistributed_orders_ushaped,
+  SAFE_MULTIPLY(order_window_bn, percentile_order_share_pageviews) AS redistributed_orders_pageviews,
+  SAFE_MULTIPLY(order_window_bn, percentile_order_share_linear) AS redistributed_orders_linear,
+  CASE 
+    WHEN order_window_bn = 0 THEN (SAFE_MULTIPLY(order_window_bn, (percentile_order_share_pageviews+percentile_order_share_ushape)/2))
+    ELSE (SAFE_MULTIPLY(order_window_bn, (percentile_order_share_pageviews+percentile_order_share_linear)/2))
+  END AS redistributed_orders_combo,
+
+  SAFE_MULTIPLY(order_revenue_bn, percentile_order_share_ushape) AS redistributed_revenue_ushaped,
+  SAFE_MULTIPLY(order_revenue_bn, percentile_order_share_pageviews) AS redistributed_revenue_pageviews,
+  SAFE_MULTIPLY(order_revenue_bn, percentile_order_share_linear) AS redistributed_revenue_linear,
+  CASE 
+    WHEN order_window_bn = 0 THEN (SAFE_MULTIPLY(order_revenue_bn, (percentile_order_share_pageviews+percentile_order_share_ushape)/2))
+    ELSE (SAFE_MULTIPLY(order_revenue_bn, (percentile_order_share_pageviews+percentile_order_share_linear)/2))
+  END AS redistributed_revenue_combo,
+
+FROM add_bignumeric_rownumber
+)
+
+SELECT * EXCEPT(order_window_bn, order_revenue_bn, rn3, rn4),
+rn3 AS row_asc,
+rn4 AS row_desc
+FROM calculate_percentiles_final
