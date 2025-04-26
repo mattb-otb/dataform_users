@@ -5,13 +5,13 @@ config {
     tags: ["daily-update", "gold"],
     bigquery: {
         partitionBy: "date",
-         clusterBy: ["user_pseudo_id", "brand"],
+         clusterBy: ["primary_id", "brand"],
         labels: {environment: "gold"}
     },
     columns:{
         date: "Start date of the session.",
         brand: "Brand. On The Beach, Sunshine and On The Beach IE.",
-        user_pseudo_id: "User pseudo ID straight from raw GA4 data.", 
+        primary_id: "Best User ID from Bloomreach and GA4.", 
         ids: "All known user IDs and Order Codes.", 
         session: "Session level data, including session IDs",
         channel: "Top in day session channels",
@@ -60,10 +60,12 @@ LEFT JOIN ${ref("stg_attribution")} AS b
 arrange_columns AS (
   SELECT 
   date,
-  user_pseudo_id,
-    'On The Beach' AS brand,
+  'On The Beach' AS brand,
+  best_id AS primary_id,
     STRUCT(
-      user_ids AS ga4_user_ids,
+      user_id AS user_id,
+      user_pseudo_id AS device_id,
+      bloomreach_id AS bloomreach_id,
       order_codes AS order_codes
     ) AS ids,
   STRUCT(

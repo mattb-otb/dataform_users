@@ -5,56 +5,39 @@ config {
     tags: ["daily-update", "gold"],
     bigquery: {
         partitionBy: "date",
-        clusterBy: ["user_pseudo_id"],
+        clusterBy: ["best_id"],
         labels: {environment: "gold"}
     },
     columns:{
         date: "Start date of the session.",
         table_suffix: "Date suffix. Used primarily to manage updates in partitions.",
-        user_id: "User pseudo ID straight from raw GA4 data.", 
+        best_id: "User pseudo ID straight from raw GA4 data.", 
     }
 }
 
 -- Extracting Orders
 WITH base AS (
-SELECT * FROM  ${ref("src_user_timeline")}
-),
-
--- Get other user_ids
-other_ids AS (
-SELECT 
-  *
-FROM ${ref("src_user_ids")}
-WHERE brand = 'OTB UK'
-),
-
-join_other_ids AS(
-SELECT 
-  a.*,
-  b.user_ids
-  FROM base AS a
-  LEFT JOIN other_ids AS b
-  ON a.user_pseudo_id = b.user_pseudo_id
+SELECT * FROM  ${ref("src_session_user_backfill")}
 ),
 
 -- flag for purchase days, so new and repeat customer are always flagged across every session that day
 purchase_daily_flag AS (
 SELECT
   date,
-  user_pseudo_id,
+  best_id,
   TRUE AS daily_purchase_flag
-FROM join_other_ids  
+FROM base  
 WHERE order_count > 0
-GROUP by date, user_pseudo_id, daily_purchase_flag
+GROUP by date, best_id, daily_purchase_flag
 ),
 
 join_daily_purchase_flag AS (
 SELECT
   a.*,
   CAST(COALESCE(b.daily_purchase_flag,FALSE) AS BOOL) AS daily_purchase_flag
-FROM join_other_ids AS a
+FROM base AS a
   LEFT JOIN purchase_daily_flag AS b
-    ON a.user_pseudo_id = b.user_pseudo_id
+    ON a.best_id = b.best_id
       AND a.date = b.date
 ),
 
@@ -83,7 +66,7 @@ add_cohorts AS (
 add_last_cohort_raw AS (
 SELECT 
   *, 
-  LAST_VALUE(cohort) OVER (PARTITION BY user_pseudo_id ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS previous_cohort
+  LAST_VALUE(cohort) OVER (PARTITION BY best_id ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS previous_cohort
 FROM add_cohorts
 ),
 
@@ -92,7 +75,7 @@ add_cohort_windows AS (
 SELECT
   *,
   SUM(CASE WHEN cohort 
-  <> previous_cohort THEN 1 ELSE 0 END) OVER (PARTITION BY user_pseudo_id ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cohort_change_window
+  <> previous_cohort THEN 1 ELSE 0 END) OVER (PARTITION BY best_id ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cohort_change_window
 FROM add_last_cohort_raw
 ),
 
@@ -100,14 +83,14 @@ FROM add_last_cohort_raw
 add_last_cohort AS (
 SELECT 
   * EXCEPT(previous_cohort),
-  FIRST_VALUE(previous_cohort) OVER (PARTITION BY user_pseudo_id, cohort_change_window ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS previous_cohort
+  FIRST_VALUE(previous_cohort) OVER (PARTITION BY best_id, cohort_change_window ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS previous_cohort
 FROM add_cohort_windows
 ),
 
 -- calculate min and max timestamp for each user and cohort change window
 cohort_time_diff AS (
 SELECT 
-    user_pseudo_id,
+    best_id,
     cohort_change_window,
     MIN(session_timestamp) AS first_session_timestamp,
     MAX(session_timestamp) AS last_session_timestamp
@@ -124,21 +107,21 @@ add_cohort_days AS (
     TIMESTAMP_DIFF(b.last_session_timestamp, b.first_session_timestamp, DAY)+1 AS cohort_duration_days
 FROM add_last_cohort AS a
 LEFT JOIN cohort_time_diff AS b
-    ON a.user_pseudo_id = b.user_pseudo_id 
+    ON a.best_id = b.best_id 
     AND a.cohort_change_window = b.cohort_change_window
 ),
 
 add_last_daily_cohort AS (
 SELECT    
   *  ,
-  LAST_VALUE(cohort) OVER (PARTITION BY date, user_pseudo_id ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS last_daily_cohort
+  LAST_VALUE(cohort) OVER (PARTITION BY date, best_id ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS last_daily_cohort
   FROM add_cohort_days
 ),
 
 add_first_daily_cohort AS (
 SELECT    
   * , 
-  FIRST_VALUE(cohort) OVER (PARTITION BY date, user_pseudo_id ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS first_daily_cohort, 
+  FIRST_VALUE(cohort) OVER (PARTITION BY date, best_id ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS first_daily_cohort, 
   FROM add_last_daily_cohort
 ),
 
@@ -146,10 +129,10 @@ SELECT
 distinct_prev_day_cohort AS (
 SELECT 
   date,
-  user_pseudo_id,
-  LAG(last_daily_cohort) OVER (PARTITION BY user_pseudo_id ORDER BY date) AS last_daily_cohort_prev_day, 
+  best_id,
+  LAG(last_daily_cohort) OVER (PARTITION BY best_id ORDER BY date) AS last_daily_cohort_prev_day, 
 FROM add_first_daily_cohort
-GROUP BY date, user_pseudo_id, last_daily_cohort
+GROUP BY date, best_id, last_daily_cohort
 ),
 
 join_prev_day_cohort AS (
@@ -158,18 +141,18 @@ SELECT
   b.last_daily_cohort_prev_day
 FROM add_first_daily_cohort AS a 
 LEFT JOIN distinct_prev_day_cohort AS b
-  ON a.user_pseudo_id = b.user_pseudo_id
+  ON a.best_id = b.best_id
   AND a.date = b.date
 ),
 
 top_cohort AS (
 SELECT
   date,
-  user_pseudo_id,
+  best_id,
   MAX(cohort) AS top_daily_cohort,
   COUNT(*) AS cohort_count
 FROM join_prev_day_cohort
-GROUP BY date, user_pseudo_id
+GROUP BY date, best_id
 ),
 
 join_top_cohort AS (
@@ -184,7 +167,7 @@ FROM join_prev_day_cohort AS a
 LEFT JOIN top_cohort AS b
 ON 
   a.date = b.date 
-    AND a.user_pseudo_id = b.user_pseudo_id
+    AND a.best_id = b.best_id
 ),
 
 scored_changes AS (
@@ -215,7 +198,7 @@ SELECT
   FIRST_VALUE(channel) OVER user_day_window AS top_daily_channel_push, 
   LAST_VALUE(channel) OVER user_day_window AS top_daily_channel_retreat, 
 FROM calculate_shifts
-WINDOW user_day_window AS (PARTITION BY date, user_pseudo_id ORDER BY cohort_shift, pageviews DESC)
+WINDOW user_day_window AS (PARTITION BY date, best_id ORDER BY cohort_shift, pageviews DESC)
 ),
 
 -- final query

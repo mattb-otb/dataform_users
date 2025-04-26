@@ -20,3 +20,12 @@ declare({
     name: 'src_ga4_events_combined',
     description: "Processed GA4 events data for OTB/Sunshine/IE."
 });
+
+// Bloomreach data
+declare({
+    database: constants.PROJECT_NAME,
+    schema: '01_user_mb',
+    name: 'bloomreach_ids',
+    description: "BR data."
+});
+

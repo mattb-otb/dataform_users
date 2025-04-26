@@ -2,14 +2,105 @@ config {
     type: "table",
     schema: constants.DATAFORM_LV1,
     description: "Stage for GA user data.",
-    tags: ["daily-update", "silver"],
+    tags: ["daily-update", "bronze"],
     bigquery: {
-        labels: {environment: "silver"}
+        labels: {environment: "bronze"}
     },
 }
 
--- Extracting Orders
-WITH source_orders AS (
+WITH
+-- Extracting Sessions
+sessions_all AS (
+  SELECT 
+    date,
+    user_id AS user_pseudo_id,
+    session_id,
+    website_version,
+    order_code,
+    TIMESTAMP_TRUNC(session_start, SECOND) AS session_timestamp,
+    session_start,
+    channel,
+    order_count,
+    pageviews,
+    landing_pageviews,
+    create_account_events,
+    login_events,
+    deal_search_events,
+    bounced_session
+  FROM ${ref("tbl_sessions")}
+  LEFT JOIN UNNEST(SPLIT(order_codes,",")) AS order_code
+  WHERE market = 'On The Beach'
+  AND ga_platform = 'GA4'
+  AND date >= '2023-06-01'
+  --GROUP BY ALL  
+),
+
+-- Get user_ids to join to sessions
+users_all AS(
+SELECT
+  user_pseudo_id,
+  user_id,
+  ga_session_id,
+  MAX(event_timestamp) AS max_timestamp
+FROM ${ref("src_ga4_events_combined")} 
+WHERE
+  event_date BETWEEN '2023-07-01'
+  AND DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+  AND brand = 'OTB UK'
+  AND REGEXP_CONTAINS(user_id, r'[A-Z]') = FALSE
+  AND user_pseudo_id IS NOT NULL
+  AND ga_session_id IS NOT NULL
+GROUP BY ALL
+
+),
+
+-- start of back fill for user_id
+user_window AS (
+  SELECT
+    *,
+    FIRST_VALUE(user_id IGNORE NULLS) OVER 
+      (PARTITION BY user_pseudo_id ORDER BY max_timestamp ASC ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING) AS next_non_null_user_id,   
+  FROM users_all
+),
+
+-- fill missing user_ids, concat to get session IDs
+user_fill AS (
+SELECT 
+  user_pseudo_id,
+  ga_session_id,
+  COALESCE(user_id, next_non_null_user_id) AS user_id,
+  CONCAT(user_pseudo_id, ga_session_id) AS device_session_id,
+  MAX(max_timestamp) AS max_timestamp,
+FROM user_window  
+GROUP BY ALL
+),
+
+find_last_user_id AS (
+SELECT 
+* EXCEPT (user_id),
+FIRST_VALUE(user_id) OVER (PARTITION BY device_session_id ORDER BY max_timestamp DESC) AS user_id
+FROM user_fill
+),
+
+group_by_session_id AS (
+SELECT 
+device_session_id,
+user_id
+FROM find_last_user_id
+GROUP BY ALL
+),
+
+join_em AS (
+SELECT 
+  a.*,
+  b.user_id,
+FROM sessions_all AS a
+  LEFT JOIN group_by_session_id AS b
+  ON a.session_id = b.device_session_id
+),
+
+-- Get order data
+source_orders AS (
   SELECT
     order_code,
     departure_date,
@@ -28,39 +119,13 @@ WITH source_orders AS (
     AND date >= '2023-06-01'
 ),
 
--- Extracting Sessions
-sessions_all AS (
-  SELECT 
-    date,
-    user_id AS user_pseudo_id,
-    session_id,
-    website_version,
-    order_code,
-    TIMESTAMP_TRUNC(session_start, SECOND) AS session_timestamp,
-    session_start,
-    channel,
-    order_count,
-    pageviews,
-    landing_pageviews,
-    create_account_events,
-    login_events,
-    CASE WHEN ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY session_start ASC) = 1 THEN 1 ELSE 0 END AS first_visit_events,
-    deal_search_events,
-    bounced_session
-  FROM ${ref("tbl_sessions")}
-  LEFT JOIN UNNEST(SPLIT(order_codes,",")) AS order_code
-  WHERE market = 'On The Beach'
-  AND ga_platform = 'GA4'
-  AND date >= '2023-06-01'
-  GROUP BY ALL  
-),
-
 -- Combining the two to pull in return holiday dates, profit and revenue
 full_data AS (
   SELECT
     a.date,
     a.session_timestamp,
     a.user_pseudo_id,
+    a.user_id,
     a.session_id,
     a.channel,
     a.website_version,
@@ -71,7 +136,6 @@ full_data AS (
     a.landing_pageviews,
     a.create_account_events,
     a.login_events,
-    a.first_visit_events,
     a.deal_search_events,
   -- Joined order data
     b.repeat_booking_mi,
@@ -80,18 +144,18 @@ full_data AS (
     b.return_date,
     b.profit,
     b.revenue
-  FROM sessions_all a
+  FROM join_em a
   LEFT JOIN source_orders b
   ON a.order_code = b.order_code
 ),
 
 orders_per_day AS (
   SELECT
-    user_pseudo_id,
+    user_id,
     date,
     MAX(order_flag) AS has_order_that_day
   FROM full_data
-  GROUP BY user_pseudo_id, date
+  GROUP BY user_id, date
 ),
 
 join_order_date_flag AS (
@@ -100,7 +164,7 @@ join_order_date_flag AS (
     b.has_order_that_day AS daily_order_flag
   FROM full_data AS a
   LEFT JOIN orders_per_day AS b
-    ON a.user_pseudo_id = b.user_pseudo_id
+    ON a.user_id = b.user_id
     AND a.date = b.date
 ),
 
@@ -109,9 +173,10 @@ full_data_flat AS (
   SELECT
   -- Groups
     date,
-    user_pseudo_id,
     session_id,
-    channel,
+    ANY_VALUE(user_id) AS user_id,
+    ANY_VALUE(user_pseudo_id) AS user_pseudo_id,
+    ANY_VALUE(channel) AS channel,
     SAFE_CAST(LOGICAL_AND(repeat_booking_mi) AS INT64) AS repeat_booking_mi,
     MIN(session_timestamp) AS session_timestamp,
     MAX(order_flag) AS order_flag,
@@ -125,7 +190,6 @@ full_data_flat AS (
     ANY_VALUE(landing_pageviews) AS landing_pageviews,
     ANY_VALUE(create_account_events) AS create_account_events,
     ANY_VALUE(login_events) AS login_events,
-    ANY_VALUE(first_visit_events) AS first_visit_events,
     ANY_VALUE(deal_search_events) AS deal_search_events,
     MAX(departure_date) AS departure_date,
     MAX(duration) AS duration,
@@ -133,21 +197,46 @@ full_data_flat AS (
     SUM(profit) AS profit,
     SUM(revenue) AS revenue
   FROM join_order_date_flag  
-  GROUP BY date, user_pseudo_id, session_id, channel
+  GROUP BY date, session_id
+),
+
+-- Join Bloomreach
+-- Get Bloomreach IDs
+bloomreach_ids AS (
+SELECT 
+    *
+FROM ${ref("bloomreach_ids")} 
+),
+
+join_bloomreach_ids AS (
+  SELECT 
+    a.*,
+    ARRAY_AGG(b.internal_customer_id ORDER BY b.internal_customer_id ASC)[OFFSET(0)] AS bloomreach_id
+  FROM full_data_flat AS a
+  LEFT JOIN bloomreach_ids AS b
+    ON COALESCE(LOWER(a.user_id), LOWER(a.user_pseudo_id)) = LOWER(b.id_value)
+  GROUP BY ALL
+),
+
+get_best_user_id AS (
+SELECT
+    *,
+    COALESCE(bloomreach_id, user_id, user_pseudo_id) AS best_id
+FROM join_bloomreach_ids        
 ),
 
 add_rolling_window AS (
 SELECT
   *,
-  SUM(order_flag) OVER (PARTITION BY user_pseudo_id ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rolling_order_window
-FROM full_data_flat
+  SUM(order_flag) OVER (PARTITION BY best_id ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rolling_order_window
+FROM get_best_user_id
 ),
 
 -- Add first order window lag because some metrics use a pre-purchase window, some a post-purchase window
 window_lag AS (
   SELECT 
     *,
-     LAG(rolling_order_window, 1, 0) OVER (PARTITION BY user_pseudo_id ORDER BY session_timestamp) AS first_order_window
+     LAG(rolling_order_window, 1, 0) OVER (PARTITION BY best_id ORDER BY session_timestamp) AS first_order_window
   FROM add_rolling_window  
 ),
 
@@ -155,28 +244,28 @@ window_lag AS (
 -- Get previous channel in the order window
 previous_channel AS (
   SELECT
-    user_pseudo_id,
+    best_id,
     session_timestamp,
     channel,
     first_order_window,
-    LAG(channel) OVER (PARTITION BY user_pseudo_id, first_order_window ORDER BY session_timestamp) AS prev_channel
+    LAG(channel) OVER (PARTITION BY best_id, first_order_window ORDER BY session_timestamp) AS prev_channel
   FROM window_lag
 ),
 
 -- All channels in purchase path
 all_channels_in_path AS (
 SELECT 
-  user_pseudo_id,
+  best_id,
   first_order_window,
   STRING_AGG(channel, ' / ' ORDER BY session_timestamp) AS ordered_channels
 FROM previous_channel 
-GROUP BY user_pseudo_id, first_order_window
+GROUP BY best_id, first_order_window
 ),
 
 -- Remove duplicate channels, so if a user hits a channel twice in a row, it will only count once.
 dedupe AS (
 SELECT 
-  user_pseudo_id,
+  best_id,
   first_order_window,
   STRING_AGG(channel, ' / ' ORDER BY session_timestamp) AS ordered_channels
 FROM previous_channel
@@ -187,12 +276,12 @@ GROUP BY ALL
 -- Get non direct channel list
 nondirect_channels_in_path AS (
   SELECT 
-    user_pseudo_id,
+    best_id,
     first_order_window,
     STRING_AGG(channel, ' / ' ORDER BY session_timestamp) AS ordered_channels
   FROM previous_channel
   WHERE channel != 'Brand - Direct'
-  GROUP BY user_pseudo_id, first_order_window
+  GROUP BY best_id, first_order_window
 ),
 
 -- join back to the user and their order window
@@ -204,13 +293,13 @@ join_channels_to_main_branch AS (
     COALESCE(d.ordered_channels, 'Brand - Direct') AS order_channel_path_nondirect
   FROM window_lag AS a
   LEFT JOIN dedupe AS b
-    ON a.user_pseudo_id = b.user_pseudo_id
+    ON a.best_id = b.best_id
     AND a.first_order_window = b.first_order_window
   LEFT JOIN all_channels_in_path AS c
-    ON a.user_pseudo_id = c.user_pseudo_id
+    ON a.best_id = c.best_id
     AND a.first_order_window = c.first_order_window
   LEFT JOIN nondirect_channels_in_path AS d
-    ON a.user_pseudo_id = d.user_pseudo_id
+    ON a.best_id = d.best_id
     AND a.first_order_window = d.first_order_window
 ),
 
@@ -219,52 +308,52 @@ join_channels_to_main_branch AS (
 window_calculations AS (
   SELECT 
     *,
-    COUNT(DISTINCT session_id) OVER (PARTITION BY user_pseudo_id, first_order_window) AS session_count,
+    COUNT(DISTINCT session_id) OVER (PARTITION BY best_id, first_order_window) AS session_count,
     DATE_DIFF(
-      LAST_VALUE(session_timestamp) OVER (PARTITION BY user_pseudo_id, first_order_window ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),
-      FIRST_VALUE(session_timestamp) OVER (PARTITION BY user_pseudo_id, first_order_window ORDER BY session_timestamp), DAY) AS orders_window_days,
+      LAST_VALUE(session_timestamp) OVER (PARTITION BY best_id, first_order_window ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),
+      FIRST_VALUE(session_timestamp) OVER (PARTITION BY best_id, first_order_window ORDER BY session_timestamp), DAY) AS orders_window_days,
     CASE -- Engaged session flag
       WHEN (deal_search_events >= 1 OR pageviews >= 2 OR login_events > 0 OR create_account_events > 0 OR order_count > 0) THEN TRUE
     ELSE FALSE END AS engaged_flag, 
     SPLIT(order_channel_path, ' / ')[SAFE_OFFSET(0)] AS first_channel_order_window,
     SPLIT(order_channel_path, ' / ')[SAFE_OFFSET(ARRAY_LENGTH(SPLIT(order_channel_path, ' / ')) - 1)] AS last_channel_order_window,
     SPLIT(order_channel_path_nondirect, ' / ')[SAFE_OFFSET(ARRAY_LENGTH(SPLIT(order_channel_path_nondirect, ' / ')) - 1)] AS last_channel_order_window_nondirect,
-    SUM(order_count) OVER (PARTITION BY user_pseudo_id) AS total_order_count,
-    MAX(duration) OVER (PARTITION BY user_pseudo_id, rolling_order_window) AS last_duration,
-    MAX(return_date) OVER (PARTITION BY user_pseudo_id, rolling_order_window) AS last_return_date,
-    MAX(CASE WHEN order_count > 0 THEN session_timestamp END) OVER (PARTITION BY user_pseudo_id, rolling_order_window) AS last_purchase_date,
-    MAX(CASE WHEN bounced_session = 0 THEN session_timestamp END) OVER (PARTITION BY user_pseudo_id, rolling_order_window) AS last_engaged_session_date,
+    SUM(order_count) OVER (PARTITION BY best_id) AS total_order_count,
+    MAX(duration) OVER (PARTITION BY best_id, rolling_order_window) AS last_duration,
+    MAX(return_date) OVER (PARTITION BY best_id, rolling_order_window) AS last_return_date,
+    MAX(CASE WHEN order_count > 0 THEN session_timestamp END) OVER (PARTITION BY best_id, rolling_order_window) AS last_purchase_date,
+    MAX(CASE WHEN bounced_session = 0 THEN session_timestamp END) OVER (PARTITION BY best_id, rolling_order_window) AS last_engaged_session_date,
     CASE 
-      WHEN (SUM(order_count) OVER (PARTITION BY user_pseudo_id, rolling_order_window)) > 0 THEN TRUE
+      WHEN (SUM(order_count) OVER (PARTITION BY best_id, rolling_order_window)) > 0 THEN TRUE
       ELSE FALSE END AS purchaser, -- Has purchased ever
     CASE
-      WHEN SUM(order_flag) OVER (PARTITION BY user_pseudo_id ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) > 1 THEN TRUE
+      WHEN SUM(order_flag) OVER (PARTITION BY best_id ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) > 1 THEN TRUE
       ELSE FALSE END AS repeat_purchaser,
     CASE
-      WHEN MAX(repeat_booking_mi) OVER (PARTITION BY user_pseudo_id, first_order_window) > 0 THEN TRUE
+      WHEN MAX(repeat_booking_mi) OVER (PARTITION BY best_id, first_order_window) > 0 THEN TRUE
       ELSE FALSE END AS repeat_purchaser_mi
   FROM join_channels_to_main_branch
   GROUP BY ALL
 ),
 
--- New CTE branch to get an array of all return dates by user_pseudo_id
+-- New CTE branch to get an array of all return dates by best_id
     return_date_array AS (
     SELECT 
-      user_pseudo_id, 
+      best_id, 
       ARRAY_AGG(return_date ORDER BY return_date) AS future_return_dates_array
     FROM window_calculations
     WHERE return_date IS NOT NULL
-    GROUP BY user_pseudo_id
+    GROUP BY best_id
     ),
 
-    -- New CTE branch to get an array of all return dates by user_pseudo_id
+    -- New CTE branch to get an array of all return dates by best_id
     departure_date_array AS (
     SELECT 
-      user_pseudo_id, 
+      best_id, 
       ARRAY_AGG(departure_date ORDER BY departure_date) AS future_departure_dates_array
     FROM window_calculations
     WHERE return_date IS NOT NULL
-    GROUP BY user_pseudo_id
+    GROUP BY best_id
     ),
 
 -- Join back to the main table, but only when the session timestamp is 5+ days after the last return date
@@ -284,9 +373,9 @@ SELECT
       WHERE return_timestamp < session_timestamp),INTERVAL 5 DAY),TRUE,FALSE) AS returned_home_5d_plus
 FROM window_calculations AS a
 LEFT JOIN return_date_array AS b
-  ON a.user_pseudo_id = b.user_pseudo_id
+  ON a.best_id = b.best_id
 LEFT JOIN departure_date_array AS c
-  ON a.user_pseudo_id = c.user_pseudo_id
+  ON a.best_id = c.best_id
 ),
 
 -- add various daily channel calculations
@@ -294,12 +383,12 @@ first_last_daily_channel AS (
 SELECT * FROM (
   SELECT
     date,
-    user_pseudo_id,
+    best_id,
     LAST_VALUE(channel) OVER user_day_window AS last_daily_channel,
     FIRST_VALUE(channel) OVER user_day_window AS first_daily_channel,
     ROW_NUMBER() OVER user_day_window AS rn
   FROM check_return_dates
-  WINDOW user_day_window AS (PARTITION BY date, user_pseudo_id ORDER BY session_timestamp 
+  WINDOW user_day_window AS (PARTITION BY date, best_id ORDER BY session_timestamp 
   )
 )
 WHERE rn = 1
@@ -312,18 +401,18 @@ SELECT
   b.first_daily_channel,
   FROM check_return_dates AS a
 LEFT JOIN first_last_daily_channel AS b
-  ON a.user_pseudo_id = b.user_pseudo_id
+  ON a.best_id = b.best_id
   AND a.date = b.date
 ),
 
 get_prev_daily_channel AS (
 SELECT
   date,
-  user_pseudo_id,
+  best_id,
   last_daily_channel,
-  LAG(last_daily_channel) OVER (PARTITION BY user_pseudo_id ORDER BY date) AS previous_last_daily_channel 
+  LAG(last_daily_channel) OVER (PARTITION BY best_id ORDER BY date) AS previous_last_daily_channel 
 FROM join_daily_channel
-GROUP BY date, user_pseudo_id, last_daily_channel
+GROUP BY date, best_id, last_daily_channel
 ),
 
 join_prev_channel AS (
@@ -333,13 +422,14 @@ SELECT
 FROM join_daily_channel AS a
 LEFT JOIN get_prev_daily_channel AS b
   ON a.date = b.date
-    AND a.user_pseudo_id = b.user_pseudo_id
+    AND a.best_id = b.best_id
 ),
 
 -- add engaged metrics windows
 add_timebased_calculations AS (
 SELECT 
   *,
+  CASE WHEN ROW_NUMBER() OVER (PARTITION BY best_id ORDER BY session_timestamp ASC) = 1 THEN 1 ELSE 0 END AS first_visit_events,
   CASE -- Has made a purchase in the last 12 months
   WHEN last_purchase_date BETWEEN TIMESTAMP_SUB(session_timestamp, INTERVAL 365 DAY) AND session_timestamp THEN TRUE ELSE FALSE END AS purchased_last_12m,    
   CASE -- Has made a purchase in the last 90 days

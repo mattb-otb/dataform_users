@@ -5,13 +5,13 @@ config {
     tags: ["daily-update", "gold"],
     bigquery: {
         partitionBy: "date",
-        clusterBy: ["user_pseudo_id"],
+        clusterBy: ["best_id"],
         labels: {environment: "gold"}
     },
     columns:{
         date: "Start date of the session.",
         table_suffix: "Date suffix. Used primarily to manage updates in partitions.",
-        user_id: "User pseudo ID straight from raw GA4 data.", 
+        best_id: "Best ID straight from raw GA4 data.", 
     }
 }
 
@@ -20,16 +20,16 @@ WITH
 add_row_numbers AS (
 SELECT 
   date,
-  user_pseudo_id,
+  best_id,
   session_timestamp,
   session_id,
   order_count,
   first_order_window,
-  MAX(revenue) OVER (PARTITION BY user_pseudo_id, first_order_window) AS revenue,
+  MAX(revenue) OVER (PARTITION BY best_id, first_order_window) AS revenue,
   pageviews,
-  ROW_NUMBER() OVER (PARTITION BY user_pseudo_id, first_order_window ORDER BY session_timestamp ASC) AS rn3,
-  ROW_NUMBER() OVER (PARTITION BY user_pseudo_id, first_order_window ORDER BY session_timestamp DESC) AS rn4,
-FROM ${ref("src_user_timeline")}
+  ROW_NUMBER() OVER (PARTITION BY best_id, first_order_window ORDER BY session_timestamp ASC) AS rn3,
+  ROW_NUMBER() OVER (PARTITION BY best_id, first_order_window ORDER BY session_timestamp DESC) AS rn4,
+FROM ${ref("src_session_user_backfill")}
 ),
 
 -- add ushape column
@@ -45,7 +45,7 @@ ORDER BY session_timestamp ASC
 null_last_window AS (
 SELECT 
   * EXCEPT(pageviews, rn3, rn4, ranking),
-    CASE WHEN revenue IS NULL THEN NULL ELSE MAX(date) OVER (PARTITION BY user_pseudo_id, first_order_window) END AS order_date, 
+    CASE WHEN revenue IS NULL THEN NULL ELSE MAX(date) OVER (PARTITION BY best_id, first_order_window) END AS order_date, 
     CASE WHEN revenue IS NULL THEN NULL ELSE pageviews END AS pageviews,
     CASE WHEN revenue IS NULL THEN NULL ELSE rn3 END AS rn3,
     CASE WHEN revenue IS NULL THEN NULL ELSE rn4 END AS rn4,
@@ -57,10 +57,10 @@ FROM add_ushape
 add_rolling_counts AS (
 SELECT 
   *,
-  MAX(order_count) OVER (PARTITION BY user_pseudo_id, first_order_window) AS order_window,
-  SUM(ranking) OVER (PARTITION BY user_pseudo_id, first_order_window) AS rolling_count_ushape,
-  SUM(pageviews) OVER (PARTITION BY user_pseudo_id, first_order_window) AS rolling_count_pageviews,
-  SUM(rn3) OVER (PARTITION BY user_pseudo_id, first_order_window) AS rolling_count_linear
+  MAX(order_count) OVER (PARTITION BY best_id, first_order_window) AS order_window,
+  SUM(ranking) OVER (PARTITION BY best_id, first_order_window) AS rolling_count_ushape,
+  SUM(pageviews) OVER (PARTITION BY best_id, first_order_window) AS rolling_count_pageviews,
+  SUM(rn3) OVER (PARTITION BY best_id, first_order_window) AS rolling_count_linear
 FROM null_last_window
 ),
 
