@@ -91,7 +91,7 @@ arrange_columns AS (
       website_version,
       engaged_flag AS engaged_session_flag
     ) AS session,
-    STRUCT( 
+  STRUCT( 
       bounced_session AS bounced_sessions,
       pageviews,
       landing_pageviews,
@@ -100,7 +100,6 @@ arrange_columns AS (
       first_visit_events AS first_visits,
       deal_search_events AS deal_searches
     ) AS session_metrics,
-
   STRUCT(
       cohort,
       cohort_change_window,
@@ -142,8 +141,6 @@ arrange_columns AS (
       return_dates,
       departure_dates
     ) AS customer,
-
-
   STRUCT(
         order_count,
         redistributed_orders_ushaped AS order_count_ushaped,
@@ -166,10 +163,9 @@ arrange_columns AS (
     CASE WHEN first_order_window = total_order_count THEN NULL ELSE order_channel_path_full END AS purchase_channel_path_full,
     CASE WHEN first_order_window = total_order_count THEN NULL ELSE session_count END AS max_sessions,
     CASE WHEN first_order_window = total_order_count THEN NULL ELSE orders_window_days END AS max_days,
-    CASE WHEN first_order_window = total_order_count THEN NULL ELSE day_number_in_order_window END AS day_number_in_order_window
+    CASE WHEN first_order_window = total_order_count THEN NULL ELSE day_number_in_order_window END AS day_number_in_order_window,
+    CASE WHEN first_order_window = total_order_count THEN NULL ELSE day_before_order END AS day_before_order
     ) AS order_window,
-
-
 FROM join_mwi_data
 )
 

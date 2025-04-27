@@ -22,7 +22,7 @@ add_total_orders_per_customer AS (
 SELECT 
     *,
     DATE_DIFF(date, FIRST_VALUE(date) OVER (PARTITION BY best_id, first_order_window ORDER BY date ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), DAY)+1 AS day_number_in_order_window,
-    DATE_DIFF(date, FIRST_VALUE(date) OVER (PARTITION BY best_id, first_order_window ORDER BY date DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), DAY)+1 AS day_before_order
+    DATE_DIFF(date, FIRST_VALUE(date) OVER (PARTITION BY best_id, first_order_window ORDER BY date DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), DAY) AS day_before_order
 FROM ${ref("src_session_user_backfill")}
 ),
 
