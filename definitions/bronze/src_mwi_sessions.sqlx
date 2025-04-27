@@ -1,0 +1,61 @@
+config { 
+    type: "table",
+    schema: constants.DATAFORM_LV1,
+    description: "Stage for MWI user data.",
+    tags: ["daily-update", "bronze"],
+    bigquery: {
+        labels: {environment: "bronze"}
+    },
+}
+
+WITH tbl1 AS (SELECT
+  event_date,
+  event_timestamp,
+  event_name,
+  user_pseudo_id,
+  user_id,
+  ga_session_id,
+  CONCAT(user_pseudo_id, ga_session_id) AS device_session_id,
+  -- MAX(IF(ep.key = 'mwi_buying_stage_label', ep.value.double_value, NULL)) AS mwi_buying_stage_label,
+  -- MAX(IF(ep.key = 'mwi_intent_xc_latest', ep.value.string_value, NULL)) AS mwi_intent_xc_latest,
+  MAX(IF(ep.key = 'mwi_buying_stage_max_label', ep.value.string_value, NULL)) AS mwi_buying_stage_max_label,
+  -- MAX(IF(ep.key = 'mwi_journey_state', ep.value.string_value, NULL)) AS mwi_journey_state,
+
+  -- MAX(IF(ep.key = 'mwi_momentum_xc_momentum', ep.value.double_value, NULL)) AS mwi_momentum_xc_momentum,
+  -- MAX(IF(ep.key = 'mwi_journey_performance_score', ep.value.string_value, NULL)) AS mwi_journey_performance_score,
+  -- MAX(IF(ep.key = 'mwi_journey_segment_mwi', ep.value.string_value, NULL)) AS mwi_journey_segment_mwi,
+  MAX(IF(ep.key = 'mwi_momentum_xc_momentum_label', ep.value.string_value, NULL)) AS mwi_momentum_xc_momentum_label,
+
+  -- MAX(IF(ep.key = 'mwi_intent_xc_max', ep.value.double_value, NULL)) AS mwi_intent_xc_max,
+  -- MAX(IF(ep.key = 'mwi_intent_xc_latest_label', ep.value.string_value, NULL)) AS mwi_intent_xc_latest_label,
+  -- MAX(IF(ep.key = 'mwi_intent_xc_max_label', ep.value.string_value, NULL)) AS mwi_intent_xc_max_label,
+  -- MAX(IF(ep.key = 'mwi_journey_phase', ep.value.string_value, NULL)) AS mwi_journey_phase,
+
+  -- MAX(IF(ep.key = 'mwi_journey_segment_core', ep.value.double_value, NULL)) AS mwi_journey_segment_core,
+  -- MAX(IF(ep.key = 'mwi_event_type', ep.value.string_value, NULL)) AS mwi_event_type,
+
+FROM
+  ${ref("src_ga4_events_combined")} ,
+  UNNEST(event_params) AS ep
+WHERE
+  event_name = 'mwi_inference'
+  AND ep.key IN (
+      -- 'mwi_buying_stage_label',
+      -- 'mwi_intent_xc_latest',
+      'mwi_buying_stage_max_label',
+      -- 'mwi_journey_state',
+      -- 'mwi_momentum_xc_momentum',
+      -- 'mwi_journey_performance_score',
+      -- 'mwi_journey_segment_mwi',
+      'mwi_momentum_xc_momentum_label'
+      -- 'mwi_intent_xc_max',
+      -- 'mwi_intent_xc_latest_label',
+      -- 'mwi_intent_xc_max_label',
+      -- 'mwi_journey_phase',
+      -- 'mwi_journey_segment_core',
+      -- 'mwi_event_type'
+  )
+GROUP BY ALL
+)
+
+SELECT * FROM tbl1

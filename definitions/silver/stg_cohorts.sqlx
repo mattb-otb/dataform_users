@@ -2,11 +2,11 @@ config {
     type: "table",
     schema: constants.DATAFORM_LV2,
     description: "Stage table for GA user data.",
-    tags: ["daily-update", "gold"],
+    tags: ["daily-update", "silver"],
     bigquery: {
         partitionBy: "date",
         clusterBy: ["best_id"],
-        labels: {environment: "gold"}
+        labels: {environment: "silver"}
     },
     columns:{
         date: "Start date of the session.",
@@ -48,15 +48,15 @@ add_cohorts AS (
   CASE 
     WHEN purchaser IS FALSE AND engaged_flag IS FALSE THEN 1
     WHEN purchaser IS FALSE AND engaged_flag IS TRUE THEN 2
-    WHEN purchaser IS TRUE AND repeat_purchaser IS FALSE AND daily_purchase_flag IS TRUE THEN 3
-    WHEN purchaser IS TRUE AND repeat_purchaser IS FALSE AND returned_home_5d_plus IS FALSE THEN 3
-    WHEN purchaser IS TRUE AND repeat_purchaser IS FALSE AND returned_home_5d_plus IS TRUE AND engaged_flag IS FALSE THEN 4
+    WHEN purchaser IS TRUE AND repeat_purchaser IS FALSE AND daily_purchase_flag IS TRUE THEN 4
+    WHEN purchaser IS TRUE AND repeat_purchaser IS FALSE AND returned_home_5d_plus IS FALSE THEN 4
+    WHEN purchaser IS TRUE AND repeat_purchaser IS FALSE AND returned_home_5d_plus IS TRUE AND engaged_flag IS FALSE THEN 3
     WHEN purchaser IS TRUE AND repeat_purchaser IS FALSE AND returned_home_5d_plus IS TRUE AND engaged_flag IS TRUE THEN 5
     
-    WHEN repeat_purchaser IS TRUE AND daily_purchase_flag IS TRUE THEN 6   
-    WHEN repeat_purchaser IS TRUE AND returned_home_5d_plus IS FALSE THEN 6
-    WHEN repeat_purchaser IS TRUE AND returned_home_5d_plus IS TRUE AND engaged_flag IS FALSE THEN 4.5
-    WHEN repeat_purchaser IS TRUE AND returned_home_5d_plus IS TRUE AND engaged_flag IS TRUE THEN 5.5
+    WHEN repeat_purchaser IS TRUE AND daily_purchase_flag IS TRUE THEN 7   
+    WHEN repeat_purchaser IS TRUE AND returned_home_5d_plus IS FALSE THEN 7
+    WHEN repeat_purchaser IS TRUE AND returned_home_5d_plus IS TRUE AND engaged_flag IS FALSE THEN 6
+    WHEN repeat_purchaser IS TRUE AND returned_home_5d_plus IS TRUE AND engaged_flag IS TRUE THEN 8
 
   ELSE 0 END AS cohort
  FROM join_daily_purchase_flag
@@ -82,8 +82,9 @@ FROM add_last_cohort_raw
 -- add last cohort
 add_last_cohort AS (
 SELECT 
-  * EXCEPT(previous_cohort),
-  FIRST_VALUE(previous_cohort) OVER (PARTITION BY best_id, cohort_change_window ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS previous_cohort
+  *
+  -- EXCEPT(previous_cohort),
+ -- FIRST_VALUE(previous_cohort) OVER (PARTITION BY best_id ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS previous_cohort
 FROM add_cohort_windows
 ),
 
@@ -150,7 +151,7 @@ SELECT
   date,
   best_id,
   MAX(cohort) AS top_daily_cohort,
-  COUNT(*) AS cohort_count
+ -- COUNT(*) AS cohort_count
 FROM join_prev_day_cohort
 GROUP BY date, best_id
 ),
@@ -159,10 +160,10 @@ join_top_cohort AS (
   SELECT 
   a.*,
   CASE 
-  WHEN cohort = 3 THEN 3
-  WHEN cohort = 6 THEN 6
+  WHEN cohort = 4 THEN 4
+  WHEN cohort = 7 THEN 7
   ELSE b.top_daily_cohort END AS top_daily_cohort,
-  b.cohort_count as cohort_count,
+ -- b.cohort_count as cohort_count,
 FROM join_prev_day_cohort AS a
 LEFT JOIN top_cohort AS b
 ON 
@@ -174,10 +175,10 @@ scored_changes AS (
   SELECT
     *,
     CASE 
-      WHEN previous_cohort IS NULL THEN 0
-      WHEN cohort > previous_cohort THEN 1
-      WHEN cohort < previous_cohort THEN -1
-      ELSE 0
+      WHEN previous_cohort IS NULL THEN 1
+    --   WHEN cohort > previous_cohort THEN 1
+    --   WHEN cohort < previous_cohort THEN -1
+      ELSE cohort - previous_cohort
     END AS cohort_shift
   FROM join_top_cohort
 ),
@@ -185,9 +186,8 @@ scored_changes AS (
 calculate_shifts AS (SELECT
   *,
   COUNT(*) AS total_sessions,
-  COUNTIF(cohort_shift > 0) AS positive_changes,
-  COUNTIF(cohort_shift < 0) AS negative_changes,
-  AVG(cohort_shift) AS avg_shift_per_session
+  SUM(CASE WHEN cohort_shift > 0 THEN cohort_shift ELSE 0 END) AS positive_changes,
+  SUM(CASE WHEN cohort_shift < 0 THEN cohort_shift ELSE 0 END) AS negative_changes
 FROM scored_changes
 GROUP BY ALL
 ),

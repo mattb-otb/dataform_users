@@ -2,11 +2,11 @@ config {
     type: "table",
     schema: constants.DATAFORM_LV2,
     description: "Stage table for GA user data.",
-    tags: ["daily-update", "gold"],
+    tags: ["daily-update", "silver"],
     bigquery: {
         partitionBy: "date",
         clusterBy: ["best_id"],
-        labels: {environment: "gold"}
+        labels: {environment: "silver"}
     },
     columns:{
         date: "Start date of the session.",
@@ -16,6 +16,16 @@ config {
 }
 
 WITH 
+-- Add  total orders for each user
+-- Add day in order window
+add_total_orders_per_customer AS (
+SELECT 
+    *,
+    DATE_DIFF(date, FIRST_VALUE(date) OVER (PARTITION BY best_id, first_order_window ORDER BY date ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), DAY)+1 AS day_number_in_order_window,
+    DATE_DIFF(date, FIRST_VALUE(date) OVER (PARTITION BY best_id, first_order_window ORDER BY date DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), DAY)+1 AS day_before_order
+FROM ${ref("src_session_user_backfill")}
+),
+
 -- add order window row numbers, revenue and order date windows
 add_row_numbers AS (
 SELECT 
@@ -25,11 +35,13 @@ SELECT
   session_id,
   order_count,
   first_order_window,
+  day_number_in_order_window,
+  day_before_order,
   MAX(revenue) OVER (PARTITION BY best_id, first_order_window) AS revenue,
   pageviews,
   ROW_NUMBER() OVER (PARTITION BY best_id, first_order_window ORDER BY session_timestamp ASC) AS rn3,
   ROW_NUMBER() OVER (PARTITION BY best_id, first_order_window ORDER BY session_timestamp DESC) AS rn4,
-FROM ${ref("src_session_user_backfill")}
+FROM add_total_orders_per_customer
 ),
 
 -- add ushape column

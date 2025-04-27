@@ -1,0 +1,36 @@
+config { 
+    type: "table",
+    schema: constants.DATAFORM_LV2,
+    description: "Stage table for GA user data.",
+    tags: ["daily-update", "silver"],
+    bigquery: {
+    
+        clusterBy: ["device_session_id"],
+        labels: {environment: "silver"}
+    },
+    columns:{
+        date: "Start date of the session.",
+        table_suffix: "Date suffix. Used primarily to manage updates in partitions.",
+        best_id: "User pseudo ID straight from raw GA4 data.", 
+    }
+}
+WITH
+tbl1 AS (
+SELECT
+ -- user_id,
+  device_session_id,
+--  MIN(event_timestamp) AS session_start,
+  MAX(CASE  
+    WHEN mwi_buying_stage_max_label = 'Browsing' THEN '1. Browsing'
+    WHEN mwi_buying_stage_max_label = 'Refining' THEN '2. Refining'
+    WHEN mwi_buying_stage_max_label = 'Evaluating' THEN '3. Evaluating'
+    WHEN mwi_buying_stage_max_label = 'Deciding' THEN '4. Deciding'
+    WHEN mwi_buying_stage_max_label = 'Committing' THEN '5. Committing'
+    WHEN mwi_buying_stage_max_label = 'Post Ordering' THEN '6. Post Ordering'
+    ELSE '0. Unknown' END) AS mwi_buying_stage_label,
+  MAX(mwi_momentum_xc_momentum_label) AS mwi_momentum_label
+FROM  ${ref("src_mwi_sessions")}
+GROUP BY ALL
+)
+
+SELECT * FROM tbl1

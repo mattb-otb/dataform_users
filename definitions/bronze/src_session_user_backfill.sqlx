@@ -8,33 +8,9 @@ config {
     },
 }
 
-WITH
--- Extracting Sessions
-sessions_all AS (
-  SELECT 
-    date,
-    user_id AS user_pseudo_id,
-    session_id,
-    website_version,
-    order_code,
-    TIMESTAMP_TRUNC(session_start, SECOND) AS session_timestamp,
-    session_start,
-    channel,
-    order_count,
-    pageviews,
-    landing_pageviews,
-    create_account_events,
-    login_events,
-    deal_search_events,
-    bounced_session
-  FROM ${ref("tbl_sessions")}
-  LEFT JOIN UNNEST(SPLIT(order_codes,",")) AS order_code
-  WHERE market = 'On The Beach'
-  AND ga_platform = 'GA4'
-  AND date >= '2023-06-01'
-  --GROUP BY ALL  
-),
+js {var{tracked_platform} = require("includes/tracked_platform");}
 
+WITH
 -- Get user_ids to join to sessions
 users_all AS(
 SELECT
@@ -51,7 +27,6 @@ WHERE
   AND user_pseudo_id IS NOT NULL
   AND ga_session_id IS NOT NULL
 GROUP BY ALL
-
 ),
 
 -- start of back fill for user_id
@@ -90,13 +65,35 @@ FROM find_last_user_id
 GROUP BY ALL
 ),
 
-join_em AS (
-SELECT 
-  a.*,
-  b.user_id,
-FROM sessions_all AS a
-  LEFT JOIN group_by_session_id AS b
-  ON a.session_id = b.device_session_id
+sessions_all AS (
+  SELECT 
+    s.date,
+    s.user_id AS user_pseudo_id,
+    g.user_id, -- <-- bring in the user_id from group_by_session_id
+    s.session_id,
+    s.website_version,
+    order_code,
+    TIMESTAMP_TRUNC(s.session_start, SECOND) AS session_timestamp,
+    s.session_start,
+    s.channel,
+    s.source,
+    s.medium,
+    s.campaign,
+    s.campaign_id,
+    s.order_count,
+    s.pageviews,
+    s.landing_pageviews,
+    s.create_account_events,
+    s.login_events,
+    s.deal_search_events,
+    s.bounced_session
+  FROM ${ref("tbl_sessions")} AS s
+  LEFT JOIN group_by_session_id AS g
+    ON s.session_id = g.device_session_id
+  LEFT JOIN UNNEST(SPLIT(s.order_codes, ",")) AS order_code
+  WHERE s.market = 'On The Beach'
+  AND s.ga_platform = 'GA4'
+  AND s.date >= '2023-06-01'
 ),
 
 -- Get order data
@@ -128,6 +125,11 @@ full_data AS (
     a.user_id,
     a.session_id,
     a.channel,
+    a.source,
+    a.medium,
+    a.campaign,
+    a.campaign_id,
+    ${tracked_platform("a.source", "a.medium", "a.channel")}  AS tracked_platform,
     a.website_version,
     b.order_code,
     CASE WHEN b.order_code IS NOT NULL THEN 1 ELSE 0 END AS order_flag,
@@ -144,7 +146,7 @@ full_data AS (
     b.return_date,
     b.profit,
     b.revenue
-  FROM join_em a
+  FROM sessions_all a
   LEFT JOIN source_orders b
   ON a.order_code = b.order_code
 ),
@@ -177,6 +179,11 @@ full_data_flat AS (
     ANY_VALUE(user_id) AS user_id,
     ANY_VALUE(user_pseudo_id) AS user_pseudo_id,
     ANY_VALUE(channel) AS channel,
+    ANY_VALUE(source) AS source,
+    ANY_VALUE(medium) AS medium,
+    ANY_VALUE(campaign) AS campaign,
+    ANY_VALUE(campaign_id) AS campaign_id,
+    ANY_VALUE(tracked_platform) AS tracked_platform,
     SAFE_CAST(LOGICAL_AND(repeat_booking_mi) AS INT64) AS repeat_booking_mi,
     MIN(session_timestamp) AS session_timestamp,
     MAX(order_flag) AS order_flag,
@@ -200,21 +207,81 @@ full_data_flat AS (
   GROUP BY date, session_id
 ),
 
+-- Add campaign and affiliate types
+-- get affiliate IDs and types from a gsheet
+aff_ids AS (
+  SELECT DISTINCT
+  publisher_id,
+  type,
+  'AWIN' AS platform 
+  FROM ${ref("LIVE_affiliate_publisher_ids_otb")}
+),
+
+add_campaign_type AS (
+SELECT 
+   a.*,
+  CASE
+    WHEN tracked_platform IN('Google Ads', 'Bing Ads') AND REGEXP_CONTAINS(LOWER(campaign), 'destination') THEN 'Destination'
+    WHEN tracked_platform IN('Google Ads', 'Bing Ads') AND REGEXP_CONTAINS(LOWER(campaign), 'top.150') THEN 'Top 150 Hotels'
+    WHEN tracked_platform IN('Google Ads', 'Bing Ads') AND REGEXP_CONTAINS(LOWER(campaign), 'top.500') THEN 'Top 500 Hotels'
+    WHEN tracked_platform IN('Google Ads', 'Bing Ads') AND REGEXP_CONTAINS(LOWER(campaign), 'hotel.names') THEN 'Hotel Names'
+    WHEN tracked_platform IN('Google Ads', 'Bing Ads') AND REGEXP_CONTAINS(LOWER(campaign), 'hotel') THEN 'Hotel'
+    WHEN tracked_platform IN('Google Ads', 'Bing Ads') AND REGEXP_CONTAINS(LOWER(campaign), 'generic') THEN 'Generic'
+    WHEN tracked_platform IN('Google Ads', 'Bing Ads') AND REGEXP_CONTAINS(LOWER(campaign), 'core') THEN 'Core'
+    WHEN tracked_platform IN('Google Ads', 'Bing Ads') AND REGEXP_CONTAINS(LOWER(campaign), 'holiday') THEN 'Holiday'
+    WHEN tracked_platform IN('Google Ads', 'Bing Ads') AND REGEXP_CONTAINS(LOWER(campaign), '^sf.*') THEN 'Supplier Funded'
+    WHEN tracked_platform IN('Google Ads', 'Bing Ads') THEN 'Unknown'
+    WHEN tracked_platform = 'AWIN' THEN COALESCE(INITCAP(b.type), 'Unknown')
+    WHEN tracked_platform = 'Partnerize' THEN COALESCE(INITCAP(b.type), 'Unknown')
+    WHEN tracked_platform = 'TravelSupermarket' THEN 'TravelSupermarket'
+    WHEN tracked_platform = 'Icelolly' THEN 'Icelolly'
+    WHEN tracked_platform = 'TravelZoo' THEN 'TravelZoo'
+    WHEN tracked_platform = 'Skyscanner' THEN 'Skyscanner'
+    WHEN tracked_platform = 'Dealchecker' THEN 'Dealchecker'
+    WHEN tracked_platform = 'Adup' THEN 'Prospecting'
+    WHEN tracked_platform = 'Tradedoubler' THEN 'Tradedoubler'
+    WHEN tracked_platform = 'HolidayExtras' THEN 'HolidayExtras'
+    WHEN tracked_platform = 'Clicktripz' THEN 'Clicktripz'
+    WHEN tracked_platform IN('Facebook Ads', 'TikTok') AND REGEXP_CONTAINS(LOWER(campaign), '^sf.*') THEN 'Supplier Funded'
+    WHEN tracked_platform IN('Facebook Ads', 'TikTok') AND LOWER(campaign) LIKE '%prospecting%' THEN 'Prospecting'
+    WHEN tracked_platform IN('Facebook Ads', 'TikTok') AND LOWER(campaign) LIKE '%retargeting%' THEN 'Retargeting'
+    WHEN tracked_platform IN('Facebook Ads', 'TikTok') AND LOWER(campaign) LIKE '%rtg%' THEN 'Retargeting'
+    WHEN tracked_platform IN('Facebook Ads', 'TikTok') AND LOWER(campaign) LIKE '%tof%' THEN 'Prospecting'
+    WHEN tracked_platform IN('Facebook Ads', 'TikTok') AND LOWER(campaign) LIKE '%awareness%' THEN 'Awareness'
+    WHEN tracked_platform IN('Facebook Ads', 'TikTok') AND LOWER(campaign) LIKE '%instagram%' THEN 'Instagram Post'
+    WHEN tracked_platform IN('Facebook Ads', 'TikTok') AND LOWER(campaign) LIKE '%reach%' THEN 'Awareness'
+    WHEN tracked_platform = 'YouTube' THEN 'YouTube'
+    WHEN tracked_platform = 'Adup' THEN 'Unknown'
+    WHEN LOWER(campaign) LIKE '%prospecting%' THEN 'Prospecting'
+    WHEN LOWER(campaign) LIKE '%retargeting%' THEN 'Retargeting'
+    WHEN LOWER(campaign) LIKE '%rtg%' THEN 'Retargeting'
+    WHEN LOWER(campaign) LIKE '%tof%' THEN 'Prospecting'
+    WHEN LOWER(campaign) LIKE '%awareness%' THEN 'Awareness'
+    WHEN LOWER(campaign) LIKE '%instagram%' THEN 'Instagram Post'
+  ELSE 'Unknown' END AS campaign_type,
+FROM full_data_flat AS a
+ LEFT JOIN aff_ids AS b
+  ON a.tracked_platform = b.platform
+  AND campaign_id = publisher_id
+   ),
+
 -- Join Bloomreach
 -- Get Bloomreach IDs
 bloomreach_ids AS (
 SELECT 
-    *
+   MIN(internal_customer_id) AS internal_customer_id,
+   LOWER(id_value) AS id_value
 FROM ${ref("bloomreach_ids")} 
+GROUP BY ALL
 ),
 
 join_bloomreach_ids AS (
   SELECT 
     a.*,
-    ARRAY_AGG(b.internal_customer_id ORDER BY b.internal_customer_id ASC)[OFFSET(0)] AS bloomreach_id
-  FROM full_data_flat AS a
+    b.internal_customer_id AS bloomreach_id
+  FROM add_campaign_type AS a
   LEFT JOIN bloomreach_ids AS b
-    ON COALESCE(LOWER(a.user_id), LOWER(a.user_pseudo_id)) = LOWER(b.id_value)
+    ON COALESCE(LOWER(a.user_id), LOWER(a.user_pseudo_id)) = b.id_value
   GROUP BY ALL
 ),
 
@@ -311,7 +378,7 @@ window_calculations AS (
     COUNT(DISTINCT session_id) OVER (PARTITION BY best_id, first_order_window) AS session_count,
     DATE_DIFF(
       LAST_VALUE(session_timestamp) OVER (PARTITION BY best_id, first_order_window ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING),
-      FIRST_VALUE(session_timestamp) OVER (PARTITION BY best_id, first_order_window ORDER BY session_timestamp), DAY) AS orders_window_days,
+      FIRST_VALUE(session_timestamp) OVER (PARTITION BY best_id, first_order_window ORDER BY session_timestamp), DAY)+1 AS orders_window_days,
     CASE -- Engaged session flag
       WHEN (deal_search_events >= 1 OR pageviews >= 2 OR login_events > 0 OR create_account_events > 0 OR order_count > 0) THEN TRUE
     ELSE FALSE END AS engaged_flag, 
@@ -429,7 +496,7 @@ LEFT JOIN get_prev_daily_channel AS b
 add_timebased_calculations AS (
 SELECT 
   *,
-  CASE WHEN ROW_NUMBER() OVER (PARTITION BY best_id ORDER BY session_timestamp ASC) = 1 THEN 1 ELSE 0 END AS first_visit_events,
+  CASE WHEN session_timestamp = MIN(session_timestamp) OVER (PARTITION BY best_id) THEN 1 ELSE 0 END AS first_visit_events,
   CASE -- Has made a purchase in the last 12 months
   WHEN last_purchase_date BETWEEN TIMESTAMP_SUB(session_timestamp, INTERVAL 365 DAY) AND session_timestamp THEN TRUE ELSE FALSE END AS purchased_last_12m,    
   CASE -- Has made a purchase in the last 90 days
@@ -459,3 +526,4 @@ FROM join_prev_channel
 
 -- final query
 SELECT * FROM add_timebased_calculations
+

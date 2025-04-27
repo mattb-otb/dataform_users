@@ -29,3 +29,10 @@ declare({
     description: "BR data."
 });
 
+// Affiliate IDs
+declare({
+    database: constants.PROJECT_NAME,
+    schema: 'gsheets',
+    name: 'LIVE_affiliate_publisher_ids_otb',
+    description: "Affiliate IDs and types."
+});
