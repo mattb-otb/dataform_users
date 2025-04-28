@@ -73,6 +73,11 @@ arrange_columns AS (
   date,
   'On The Beach' AS brand,
   best_id AS primary_user_id,
+  CASE
+    WHEN best_id = bloomreach_id THEN 'bloomreach_id'
+    WHEN best_id = user_id THEN 'user_id'
+    WHEN best_id = user_pseudo_id THEN 'device_id'
+  END AS primary_user_id_source,
   STRUCT(
       user_id AS user_id,
       user_pseudo_id AS device_id,
