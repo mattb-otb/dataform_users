@@ -116,7 +116,7 @@ arrange_columns AS (
       mwi_buying_stage_label AS mwi_buying_stage_label,
       mwi_momentum_label AS mwi_momentum_label
     ) AS cohort,
-      STRUCT(
+  STRUCT(
       first_daily_channel,
       last_daily_channel,
       CASE WHEN previous_last_daily_channel IS NULL THEN 'Unknown' ELSE previous_last_daily_channel END AS last_daily_channel_prev_day,
@@ -139,7 +139,14 @@ arrange_columns AS (
       has_engaged_crm_last_90_days AS engaged_crm_90days, 
       has_engaged_crm_last_365_days AS engaged_crm_365days,
       return_dates,
-      departure_dates
+      departure_dates,
+      destination_country,
+      destination_region,
+      passenger_group,
+      pax,
+      hotel,
+      hotel_board_type,
+      holiday_type
     ) AS customer,
   STRUCT(
         order_count,

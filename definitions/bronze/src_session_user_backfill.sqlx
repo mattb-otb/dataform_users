@@ -66,7 +66,7 @@ GROUP BY ALL
 ),
 
 sessions_all AS (
-  SELECT 
+SELECT 
     s.date,
     s.user_id AS user_pseudo_id,
     g.user_id, -- <-- bring in the user_id from group_by_session_id
@@ -87,13 +87,13 @@ sessions_all AS (
     s.login_events,
     s.deal_search_events,
     s.bounced_session
-  FROM ${ref("tbl_sessions")} AS s
-  LEFT JOIN group_by_session_id AS g
-    ON s.session_id = g.device_session_id
-  LEFT JOIN UNNEST(SPLIT(s.order_codes, ",")) AS order_code
-  WHERE s.market = 'On The Beach'
-  AND s.ga_platform = 'GA4'
-  AND s.date >= '2023-06-01'
+FROM ${ref("tbl_sessions")} AS s
+LEFT JOIN group_by_session_id AS g
+ON s.session_id = g.device_session_id
+LEFT JOIN UNNEST(SPLIT(s.order_codes, ",")) AS order_code
+WHERE s.market = 'On The Beach'
+AND s.ga_platform = 'GA4'
+AND s.date >= '2023-06-01'
 ),
 
 -- Get order data
@@ -104,6 +104,13 @@ source_orders AS (
     repeat_booking_ind AS repeat_booking_mi,
     gross_margin AS profit,
     gross_revenue AS revenue,
+    DestinationCountry,
+    DestinationRegion,
+    passenger_group,
+    pax,
+    hotel,
+    HotelBoardBasis,
+    holiday_type,
     TIMESTAMP_ADD(departure_date, INTERVAL duration DAY) AS return_date,
     duration
   FROM ${ref("tbl_orders")}
@@ -145,7 +152,14 @@ full_data AS (
     b.duration,
     b.return_date,
     b.profit,
-    b.revenue
+    b.revenue,
+    b.DestinationCountry AS destination_country,
+    b.DestinationRegion AS destination_region,
+    b.passenger_group AS passenger_group,
+    b.pax,
+    b.hotel,
+    b.HotelBoardBasis AS hotel_board_type,
+    b.holiday_type,
   FROM sessions_all a
   LEFT JOIN source_orders b
   ON a.order_code = b.order_code
@@ -202,7 +216,14 @@ full_data_flat AS (
     MAX(duration) AS duration,
     MAX(return_date) AS return_date,
     SUM(profit) AS profit,
-    SUM(revenue) AS revenue
+    SUM(revenue) AS revenue,
+    MAX(destination_country) AS destination_country,
+    MAX(destination_region) AS destination_region,
+    MAX(passenger_group) AS passenger_group,
+    MAX(pax) AS pax,
+    MAX(hotel) AS hotel,
+    MAX(hotel_board_type) AS hotel_board_type,
+    MAX(holiday_type) AS holiday_type
   FROM join_order_date_flag  
   GROUP BY date, session_id
 ),
