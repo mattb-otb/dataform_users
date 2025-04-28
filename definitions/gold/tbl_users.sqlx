@@ -1,7 +1,7 @@
 config { 
     type: "table",
     schema: constants.DATAFORM_LV3,
-    description: "PRS table for GA user data.",
+    description: "User data, unique session ID per row. Contains loads of awesome user, order and session stuff.",
     tags: ["daily-update", "gold"],
     bigquery: {
         partitionBy: "date",
