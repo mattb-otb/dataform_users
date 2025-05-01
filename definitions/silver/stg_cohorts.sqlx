@@ -17,7 +17,7 @@ config {
 
 -- Extracting Orders
 WITH base AS (
-SELECT * FROM  ${ref("src_session_user_backfill")}
+SELECT * FROM  ${ref("src_ids_channels")}
 ),
 
 -- flag for purchase days, so new and repeat customer are always flagged across every session that day
@@ -25,12 +25,13 @@ purchase_daily_flag AS (
 SELECT
   date,
   best_id,
-  TRUE AS daily_purchase_flag
+  TRUE AS daily_purchase_flag,
 FROM base  
 WHERE order_count > 0
 GROUP by date, best_id, daily_purchase_flag
 ),
 
+-- add a flag that coverss the whole purchase day, this ensures a user doesn't change to repeat customer if they make multiple orders in the day
 join_daily_purchase_flag AS (
 SELECT
   a.*,
@@ -41,32 +42,138 @@ FROM base AS a
       AND a.date = b.date
 ),
 
+-- Add rolling order count
+add_rolling_orders AS (
+SELECT
+  *,
+  SUM(order_count) OVER (PARTITION BY best_id ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rolling_order_count
+FROM join_daily_purchase_flag
+),
+
+-- ensure mi repeat purchase flag persists
+mi_repeat_paint AS (
+SELECT
+  * EXCEPT(repeat_purchaser_mi),
+  MAX(CAST(repeat_purchaser_mi AS INT64)) OVER (PARTITION BY best_id, first_order_window) = 1 AS repeat_purchaser_mi,
+  -- add a flag to tag sessions that are more than 90 days after the last session, to get a 'dormant' previous cohort
+  CASE 
+    WHEN LAG(session_timestamp) OVER (PARTITION BY best_id ORDER BY session_timestamp) IS NULL THEN TRUE
+    WHEN TIMESTAMP_DIFF(session_timestamp, LAG(session_timestamp) OVER (PARTITION BY best_id ORDER BY session_timestamp), DAY) > 90 THEN TRUE 
+  ELSE FALSE END AS dormant_user_flag
+FROM add_rolling_orders
+),
+
+-- flag the whole day as previously dormant when the first daily session is previously dormant
+daily_dormant_flags AS (
+  SELECT
+    best_id,
+    DATE(session_timestamp) AS session_date,
+    MAX(CAST(dormant_user_flag AS INT64)) AS dormant_day_flag
+  FROM mi_repeat_paint
+  GROUP BY best_id, session_date
+),
+join_daily_dormant_flag AS (
+SELECT
+  b.*,
+  COALESCE(d.dormant_day_flag = 1, FALSE) AS dormant_day_flag
+FROM mi_repeat_paint b
+LEFT JOIN daily_dormant_flags d
+  ON b.best_id = d.best_id
+  AND DATE(b.session_timestamp) = d.session_date
+),
+
+-- add flags for multiple repeat orders
+add_multi_order_flag AS (
+SELECT
+    *,
+    CASE WHEN rolling_order_window > 2 THEN TRUE ELSE FALSE END AS top_customer_flag
+FROM join_daily_dormant_flag
+),
+
 -- add custom cohorts
 add_cohorts AS (
  SELECT 
   *,
   CASE 
+  -- top purchaser flag
+    WHEN daily_purchase_flag IS TRUE AND top_customer_flag IS TRUE THEN 10
+    WHEN returned_home_5d_plus_new IS FALSE AND top_customer_flag IS TRUE THEN 10
+    WHEN returned_home_5d_plus_new IS TRUE AND engaged_flag IS FALSE AND top_customer_flag IS TRUE THEN 9
+    WHEN returned_home_5d_plus_new IS TRUE AND engaged_flag IS TRUE AND top_customer_flag IS TRUE THEN 10
+  -- prioritise MI repeat oder flag, even though it's not perfect
+    WHEN repeat_purchaser_mi IS TRUE AND daily_purchase_flag IS TRUE THEN 7
+    WHEN repeat_purchaser_mi IS TRUE AND purchaser IS FALSE AND engaged_flag IS TRUE THEN 8
+    WHEN repeat_purchaser_mi IS TRUE AND purchaser IS FALSE AND engaged_flag IS FALSE THEN 6
+    WHEN repeat_purchaser_mi IS TRUE AND purchaser IS TRUE AND returned_home_5d_plus_new IS FALSE THEN 7
+    WHEN repeat_purchaser_mi IS TRUE AND purchaser IS TRUE AND returned_home_5d_plus_new IS TRUE AND engaged_flag IS FALSE THEN 7
+    WHEN repeat_purchaser_mi IS TRUE AND purchaser IS TRUE AND returned_home_5d_plus_new IS TRUE AND engaged_flag IS TRUE THEN 8
+  -- tag new customers first
     WHEN purchaser IS FALSE AND engaged_flag IS FALSE THEN 1
     WHEN purchaser IS FALSE AND engaged_flag IS TRUE THEN 2
     WHEN purchaser IS TRUE AND repeat_purchaser IS FALSE AND daily_purchase_flag IS TRUE THEN 4
-    WHEN purchaser IS TRUE AND repeat_purchaser IS FALSE AND returned_home_5d_plus IS FALSE THEN 4
-    WHEN purchaser IS TRUE AND repeat_purchaser IS FALSE AND returned_home_5d_plus IS TRUE AND engaged_flag IS FALSE THEN 3
-    WHEN purchaser IS TRUE AND repeat_purchaser IS FALSE AND returned_home_5d_plus IS TRUE AND engaged_flag IS TRUE THEN 5
-    
+    WHEN purchaser IS TRUE AND repeat_purchaser IS FALSE AND returned_home_5d_plus_new IS FALSE THEN 4
+    WHEN purchaser IS TRUE AND repeat_purchaser IS FALSE AND returned_home_5d_plus_new IS TRUE AND engaged_flag IS FALSE THEN 3
+    WHEN purchaser IS TRUE AND repeat_purchaser IS FALSE AND returned_home_5d_plus_new IS TRUE AND engaged_flag IS TRUE THEN 5
+  -- tag repeat customers last that the mi flag didn't pick up  
     WHEN repeat_purchaser IS TRUE AND daily_purchase_flag IS TRUE THEN 7   
-    WHEN repeat_purchaser IS TRUE AND returned_home_5d_plus IS FALSE THEN 7
-    WHEN repeat_purchaser IS TRUE AND returned_home_5d_plus IS TRUE AND engaged_flag IS FALSE THEN 6
-    WHEN repeat_purchaser IS TRUE AND returned_home_5d_plus IS TRUE AND engaged_flag IS TRUE THEN 8
-
-  ELSE 0 END AS cohort
- FROM join_daily_purchase_flag
+    WHEN repeat_purchaser IS TRUE AND returned_home_5d_plus_new IS FALSE THEN 7
+    WHEN repeat_purchaser IS TRUE AND returned_home_5d_plus_new IS TRUE AND engaged_flag IS FALSE THEN 6
+    WHEN repeat_purchaser IS TRUE AND returned_home_5d_plus_new IS TRUE AND engaged_flag IS TRUE THEN 8
+  ELSE 0 END AS cohort,
+ FROM add_multi_order_flag
 ),
 
--- -- add last users cohort
-add_last_cohort_raw AS (
-SELECT 
-  *, 
-  LAST_VALUE(cohort) OVER (PARTITION BY best_id ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS previous_cohort
+-- find previous cohort, with calculations for the dormant user type
+add_dormant_user_flag_and_previous_cohort AS (
+SELECT
+  *,
+  CASE
+      -- Top customers who returned home
+    WHEN dormant_user_flag = TRUE 
+         AND returned_home_5d_plus_new = TRUE 
+         AND top_customer_flag IS TRUE
+      THEN -4
+    -- Repeat customers who did NOT return home yet
+    WHEN dormant_user_flag = TRUE 
+         AND returned_home_5d_plus_new = FALSE 
+         AND top_customer_flag IS TRUE
+      THEN 10
+    -- Repeat customers who returned home
+    WHEN dormant_user_flag = TRUE 
+         AND returned_home_5d_plus_new = TRUE 
+         AND (repeat_purchaser = TRUE OR repeat_purchaser_mi = TRUE)
+      THEN -3
+    -- Repeat customers who did NOT return home yet
+    WHEN dormant_user_flag = TRUE 
+         AND returned_home_5d_plus_new = FALSE 
+         AND (repeat_purchaser = TRUE OR repeat_purchaser_mi = TRUE)
+      THEN 7
+    -- New customers who did NOT return home yet
+    WHEN dormant_user_flag = TRUE 
+         AND returned_home_5d_plus_new = FALSE 
+         AND purchaser = TRUE 
+         AND (repeat_purchaser = FALSE AND repeat_purchaser_mi = FALSE)
+      THEN 4
+    -- New customers who DID return home
+    WHEN dormant_user_flag = TRUE 
+         AND returned_home_5d_plus_new = TRUE 
+         AND purchaser = TRUE 
+         AND (repeat_purchaser = FALSE AND repeat_purchaser_mi = FALSE)
+      THEN -2
+    -- First time browsers
+    WHEN dormant_user_flag = TRUE 
+         AND purchaser = FALSE 
+         AND repeat_purchaser_mi = FALSE 
+         AND first_visit_events = 1
+      THEN 0
+    -- Other browsers
+    WHEN dormant_user_flag = TRUE 
+         AND purchaser = FALSE 
+         AND repeat_purchaser_mi = FALSE
+      THEN -1
+    -- Default case: use previous cohort
+    ELSE LAG(cohort) OVER (PARTITION BY best_id ORDER BY session_timestamp)
+  END AS previous_cohort
 FROM add_cohorts
 ),
 
@@ -76,16 +183,7 @@ SELECT
   *,
   SUM(CASE WHEN cohort 
   <> previous_cohort THEN 1 ELSE 0 END) OVER (PARTITION BY best_id ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cohort_change_window
-FROM add_last_cohort_raw
-),
-
--- add last cohort
-add_last_cohort AS (
-SELECT 
-  *
-  -- EXCEPT(previous_cohort),
- -- FIRST_VALUE(previous_cohort) OVER (PARTITION BY best_id ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS previous_cohort
-FROM add_cohort_windows
+FROM add_dormant_user_flag_and_previous_cohort
 ),
 
 -- calculate min and max timestamp for each user and cohort change window
@@ -95,7 +193,7 @@ SELECT
     cohort_change_window,
     MIN(session_timestamp) AS first_session_timestamp,
     MAX(session_timestamp) AS last_session_timestamp
-FROM add_last_cohort
+FROM add_cohort_windows
 GROUP BY ALL
 ),
 
@@ -106,7 +204,7 @@ add_cohort_days AS (
     b.first_session_timestamp,
     b.last_session_timestamp,
     TIMESTAMP_DIFF(b.last_session_timestamp, b.first_session_timestamp, DAY)+1 AS cohort_duration_days
-FROM add_last_cohort AS a
+FROM add_cohort_windows AS a
 LEFT JOIN cohort_time_diff AS b
     ON a.best_id = b.best_id 
     AND a.cohort_change_window = b.cohort_change_window
@@ -126,49 +224,64 @@ SELECT
   FROM add_last_daily_cohort
 ),
 
--- Join previous day's cohort back in
-distinct_prev_day_cohort AS (
-SELECT 
-  date,
-  best_id,
-  LAG(last_daily_cohort) OVER (PARTITION BY best_id ORDER BY date) AS last_daily_cohort_prev_day, 
-FROM add_first_daily_cohort
-GROUP BY date, best_id, last_daily_cohort
-),
+-- -- Join previous day's cohort back in - ISSUES!
+-- distinct_prev_day_cohort AS ( 
+-- SELECT 
+--   date,
+--   best_id,
+--   session_id,
+-- COALESCE((CASE
+--     WHEN MAX(dormant_day_flag) IS TRUE THEN MIN(previous_cohort) OVER (PARTITION BY best_id, date)
+--   END),
+--   (LAG(last_daily_cohort) OVER (PARTITION BY best_id ORDER BY date))) AS last_daily_cohort_prev_day
+-- FROM add_first_daily_cohort
+-- GROUP BY date, best_id, session_id, previous_cohort, last_daily_cohort
+-- ),
 
-join_prev_day_cohort AS (
-SELECT
-  a.*,
-  b.last_daily_cohort_prev_day
-FROM add_first_daily_cohort AS a 
-LEFT JOIN distinct_prev_day_cohort AS b
-  ON a.best_id = b.best_id
-  AND a.date = b.date
-),
+-- join_prev_day_cohort AS (
+-- SELECT
+--   a.*,
+--   b.last_daily_cohort_prev_day
+-- FROM add_first_daily_cohort AS a 
+-- LEFT JOIN distinct_prev_day_cohort AS b
+--   ON a.session_id = b.session_id
+-- ),
 
 top_cohort AS (
 SELECT
   date,
   best_id,
   MAX(cohort) AS top_daily_cohort,
- -- COUNT(*) AS cohort_count
-FROM join_prev_day_cohort
+FROM add_first_daily_cohort
 GROUP BY date, best_id
+),
+
+top_cohort_prev_day AS (
+  SELECT
+    *,
+    LAG(top_daily_cohort) OVER (PARTITION BY best_id ORDER BY date) AS prev_day_top_daily_cohort
+  FROM top_cohort
 ),
 
 join_top_cohort AS (
   SELECT 
   a.*,
   CASE 
-  WHEN cohort = 4 THEN 4
-  WHEN cohort = 7 THEN 7
+    WHEN cohort = 4 THEN 4
+    WHEN cohort = 7 THEN 7
   ELSE b.top_daily_cohort END AS top_daily_cohort,
- -- b.cohort_count as cohort_count,
-FROM join_prev_day_cohort AS a
+  COALESCE((CASE
+    WHEN dormant_day_flag IS TRUE THEN MIN(previous_cohort) OVER (PARTITION BY a.best_id, a.date)
+  END), prev_day_top_daily_cohort) AS prev_top_daily_cohort
+FROM add_first_daily_cohort AS a
 LEFT JOIN top_cohort AS b
 ON 
   a.date = b.date 
     AND a.best_id = b.best_id
+LEFT JOIN top_cohort_prev_day AS c
+ON 
+  a.date = c.date 
+    AND a.best_id = c.best_id    
 ),
 
 scored_changes AS (
@@ -176,8 +289,6 @@ scored_changes AS (
     *,
     CASE 
       WHEN previous_cohort IS NULL THEN 1
-    --   WHEN cohort > previous_cohort THEN 1
-    --   WHEN cohort < previous_cohort THEN -1
       ELSE cohort - previous_cohort
     END AS cohort_shift
   FROM join_top_cohort

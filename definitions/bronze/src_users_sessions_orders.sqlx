@@ -1,0 +1,281 @@
+config { 
+    type: "table",
+    schema: constants.DATAFORM_LV1,
+    description: "Stage for GA user data.",
+    tags: ["daily-update", "bronze"],
+    bigquery: {
+        labels: {environment: "bronze"}
+    },
+}
+
+js {var{tracked_platform} = require("includes/tracked_platform");}
+
+WITH
+-- Get user_ids to join to sessions
+user_sessions AS (
+  SELECT
+    user_pseudo_id,
+    CASE WHEN REGEXP_CONTAINS(user_id, r'[A-Z]') = FALSE THEN user_id ELSE NULL END AS cleaned_user_id,
+    ga_session_id,
+    MAX(event_timestamp) AS max_timestamp
+  FROM ${ref("src_ga4_events_combined")}
+  WHERE
+    event_date BETWEEN '2023-07-01' AND DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+    AND brand = 'OTB UK'
+    AND user_pseudo_id IS NOT NULL
+    AND ga_session_id IS NOT NULL
+  GROUP BY user_pseudo_id, user_id, ga_session_id
+),
+
+-- Fill missing user_ids by backfill forward/backward
+filled_user_sessions AS (
+  SELECT
+    user_pseudo_id,
+    ga_session_id,
+    COALESCE(
+      cleaned_user_id,
+      FIRST_VALUE(cleaned_user_id IGNORE NULLS) OVER (PARTITION BY user_pseudo_id ORDER BY max_timestamp ASC ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING),
+      FIRST_VALUE(cleaned_user_id IGNORE NULLS) OVER (PARTITION BY user_pseudo_id ORDER BY max_timestamp DESC ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)
+    ) AS user_id,
+    CONCAT(user_pseudo_id, ga_session_id) AS device_session_id,
+    max_timestamp
+  FROM user_sessions
+),
+
+-- Deduplicate user_id per session
+session_user_ids AS (
+  SELECT
+    device_session_id,
+    user_id
+  FROM filled_user_sessions
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY device_session_id ORDER BY max_timestamp DESC) = 1
+),
+
+-- join new user id to tbl_sessions, unnest order codes
+sessions_all AS (
+SELECT 
+    s.date,
+    s.user_id AS user_pseudo_id,
+    g.user_id, -- <-- bring in the user_id from group_by_session_id
+    s.session_id,
+    s.website_version,
+    order_code,
+    TIMESTAMP_TRUNC(s.session_start, SECOND) AS session_timestamp,
+    s.session_start,
+    s.channel,
+    s.source,
+    s.medium,
+    s.campaign,
+    s.campaign_id,
+    s.order_count,
+    s.pageviews,
+    s.landing_pageviews,
+    s.create_account_events,
+    s.login_events,
+    s.deal_search_events,
+    s.bounced_session
+FROM ${ref("tbl_sessions")} AS s
+LEFT JOIN session_user_ids AS g
+ON s.session_id = g.device_session_id
+LEFT JOIN UNNEST(SPLIT(s.order_codes, ",")) AS order_code
+WHERE s.market = 'On The Beach'
+AND s.ga_platform = 'GA4'
+AND s.date >= '2023-06-01'
+),
+
+-- Get order data
+source_orders AS (
+  SELECT
+    order_code,
+    departure_date,
+    repeat_booking_ind AS repeat_booking_mi,
+    gross_margin AS profit,
+    gross_revenue AS revenue,
+    DestinationCountry,
+    DestinationRegion,
+    passenger_group,
+    pax,
+    hotel,
+    HotelBoardBasis,
+    holiday_type,
+    master_contact_details_id,
+    TIMESTAMP_ADD(departure_date, INTERVAL duration DAY) AS return_date,
+    duration
+  FROM ${ref("tbl_orders")}
+  WHERE
+    CurrentVersionInd IS TRUE
+    AND country_code IN('GB')
+    AND brand IN ('On The Beach')
+    AND test_booking_ind IS NOT TRUE
+    AND order_source <> 'OTP' 
+    AND date >= '2023-06-01'
+),
+
+-- Combining the two to pull in return holiday dates, profit and revenue
+full_data AS (
+  SELECT
+    a.date,
+    a.session_timestamp,
+    a.user_pseudo_id,
+    a.user_id,
+    a.session_id,
+    a.channel,
+    a.source,
+    a.medium,
+    a.campaign,
+    a.campaign_id,
+    ${tracked_platform("a.source", "a.medium", "a.channel")}  AS tracked_platform,
+    a.website_version,
+    b.order_code,
+    CASE WHEN b.order_code IS NOT NULL THEN 1 ELSE 0 END AS order_flag,
+    a.bounced_session,
+    a.pageviews,
+    a.landing_pageviews,
+    a.create_account_events,
+    a.login_events,
+    a.deal_search_events,
+  -- Joined order data
+    b.master_contact_details_id,
+    b.repeat_booking_mi,
+    b.departure_date,
+    b.duration,
+    b.return_date,
+    b.profit,
+    b.revenue,
+    b.DestinationCountry AS destination_country,
+    b.DestinationRegion AS destination_region,
+    b.passenger_group AS passenger_group,
+    b.pax,
+    b.hotel,
+    b.HotelBoardBasis AS hotel_board_type,
+    b.holiday_type,
+  FROM sessions_all a
+  LEFT JOIN source_orders b
+  ON a.order_code = b.order_code
+),
+
+orders_per_day AS (
+  SELECT
+    user_id,
+    date,
+    MAX(order_flag) AS has_order_that_day
+  FROM full_data
+  GROUP BY user_id, date
+),
+
+join_order_date_flag AS (
+  SELECT
+    a.*,
+    b.has_order_that_day AS daily_order_flag
+  FROM full_data AS a
+  LEFT JOIN orders_per_day AS b
+    ON a.user_id = b.user_id
+    AND a.date = b.date
+),
+
+-- Flatten out the duplicate order codes in a session, and take the sums/max across multiple order codes, add order window.
+full_data_flat AS (
+  SELECT
+  -- Groups
+    date,
+    session_id,
+    ANY_VALUE(user_id) AS user_id,
+    ANY_VALUE(user_pseudo_id) AS user_pseudo_id,
+    ANY_VALUE(channel) AS channel,
+    ANY_VALUE(source) AS source,
+    ANY_VALUE(medium) AS medium,
+    ANY_VALUE(campaign) AS campaign,
+    ANY_VALUE(campaign_id) AS campaign_id,
+    ANY_VALUE(tracked_platform) AS tracked_platform,
+    SAFE_CAST(LOGICAL_AND(repeat_booking_mi) AS INT64) AS repeat_booking_mi,
+    MIN(session_timestamp) AS session_timestamp,
+    MAX(order_flag) AS order_flag,
+    MAX(website_version) AS website_version,
+    MAX(daily_order_flag) AS daily_order_flag,
+    STRING_AGG(order_code, ', ') AS order_codes,
+  -- Calculations
+    SUM(order_flag) AS order_count,
+    ANY_VALUE(bounced_session) AS bounced_session,
+    ANY_VALUE(pageviews) AS pageviews,
+    ANY_VALUE(landing_pageviews) AS landing_pageviews,
+    ANY_VALUE(create_account_events) AS create_account_events,
+    ANY_VALUE(login_events) AS login_events,
+    ANY_VALUE(deal_search_events) AS deal_search_events,
+    MAX(master_contact_details_id) AS master_contact_details_id,
+    MAX(departure_date) AS departure_date,
+    MAX(duration) AS duration,
+    MAX(return_date) AS return_date,
+    SUM(profit) AS profit,
+    SUM(revenue) AS revenue,
+    MAX(destination_country) AS destination_country,
+    MAX(destination_region) AS destination_region,
+    MAX(passenger_group) AS passenger_group,
+    MAX(pax) AS pax,
+    MAX(REGEXP_REPLACE(hotel, r"&amp;", "&")) AS hotel,
+    MAX(hotel_board_type) AS hotel_board_type,
+    MAX(holiday_type) AS holiday_type
+  FROM join_order_date_flag  
+  GROUP BY date, session_id
+),
+
+-- Add campaign and affiliate types
+-- get affiliate IDs and types from a gsheet
+aff_ids AS (
+  SELECT DISTINCT
+  publisher_id,
+  type,
+  'AWIN' AS platform 
+  FROM ${ref("LIVE_affiliate_publisher_ids_otb")}
+),
+
+add_campaign_type AS (
+SELECT 
+   a.*,
+  CASE
+    WHEN tracked_platform IN('Google Ads', 'Bing Ads') AND REGEXP_CONTAINS(LOWER(campaign), 'destination') THEN 'Destination'
+    WHEN tracked_platform IN('Google Ads', 'Bing Ads') AND REGEXP_CONTAINS(LOWER(campaign), 'top.150') THEN 'Top 150 Hotels'
+    WHEN tracked_platform IN('Google Ads', 'Bing Ads') AND REGEXP_CONTAINS(LOWER(campaign), 'top.500') THEN 'Top 500 Hotels'
+    WHEN tracked_platform IN('Google Ads', 'Bing Ads') AND REGEXP_CONTAINS(LOWER(campaign), 'hotel.names') THEN 'Hotel Names'
+    WHEN tracked_platform IN('Google Ads', 'Bing Ads') AND REGEXP_CONTAINS(LOWER(campaign), 'hotel') THEN 'Hotel'
+    WHEN tracked_platform IN('Google Ads', 'Bing Ads') AND REGEXP_CONTAINS(LOWER(campaign), 'generic') THEN 'Generic'
+    WHEN tracked_platform IN('Google Ads', 'Bing Ads') AND REGEXP_CONTAINS(LOWER(campaign), 'core') THEN 'Core'
+    WHEN tracked_platform IN('Google Ads', 'Bing Ads') AND REGEXP_CONTAINS(LOWER(campaign), 'holiday') THEN 'Holiday'
+    WHEN tracked_platform IN('Google Ads', 'Bing Ads') AND REGEXP_CONTAINS(LOWER(campaign), '^sf.*') THEN 'Supplier Funded'
+    WHEN tracked_platform IN('Google Ads', 'Bing Ads') THEN 'Unknown'
+    WHEN tracked_platform = 'AWIN' THEN COALESCE(INITCAP(b.type), 'Unknown')
+    WHEN tracked_platform = 'Partnerize' THEN COALESCE(INITCAP(b.type), 'Unknown')
+    WHEN tracked_platform = 'TravelSupermarket' THEN 'TravelSupermarket'
+    WHEN tracked_platform = 'Icelolly' THEN 'Icelolly'
+    WHEN tracked_platform = 'TravelZoo' THEN 'TravelZoo'
+    WHEN tracked_platform = 'Skyscanner' THEN 'Skyscanner'
+    WHEN tracked_platform = 'Dealchecker' THEN 'Dealchecker'
+    WHEN tracked_platform = 'Adup' THEN 'Prospecting'
+    WHEN tracked_platform = 'Tradedoubler' THEN 'Tradedoubler'
+    WHEN tracked_platform = 'HolidayExtras' THEN 'HolidayExtras'
+    WHEN tracked_platform = 'Clicktripz' THEN 'Clicktripz'
+    WHEN tracked_platform IN('Facebook Ads', 'TikTok') AND REGEXP_CONTAINS(LOWER(campaign), '^sf.*') THEN 'Supplier Funded'
+    WHEN tracked_platform IN('Facebook Ads', 'TikTok') AND LOWER(campaign) LIKE '%prospecting%' THEN 'Prospecting'
+    WHEN tracked_platform IN('Facebook Ads', 'TikTok') AND LOWER(campaign) LIKE '%retargeting%' THEN 'Retargeting'
+    WHEN tracked_platform IN('Facebook Ads', 'TikTok') AND LOWER(campaign) LIKE '%rtg%' THEN 'Retargeting'
+    WHEN tracked_platform IN('Facebook Ads', 'TikTok') AND LOWER(campaign) LIKE '%tof%' THEN 'Prospecting'
+    WHEN tracked_platform IN('Facebook Ads', 'TikTok') AND LOWER(campaign) LIKE '%awareness%' THEN 'Awareness'
+    WHEN tracked_platform IN('Facebook Ads', 'TikTok') AND LOWER(campaign) LIKE '%instagram%' THEN 'Instagram Post'
+    WHEN tracked_platform IN('Facebook Ads', 'TikTok') AND LOWER(campaign) LIKE '%reach%' THEN 'Awareness'
+    WHEN tracked_platform = 'YouTube' THEN 'YouTube'
+    WHEN tracked_platform = 'Adup' THEN 'Unknown'
+    WHEN LOWER(campaign) LIKE '%prospecting%' THEN 'Prospecting'
+    WHEN LOWER(campaign) LIKE '%retargeting%' THEN 'Retargeting'
+    WHEN LOWER(campaign) LIKE '%rtg%' THEN 'Retargeting'
+    WHEN LOWER(campaign) LIKE '%tof%' THEN 'Prospecting'
+    WHEN LOWER(campaign) LIKE '%awareness%' THEN 'Awareness'
+    WHEN LOWER(campaign) LIKE '%instagram%' THEN 'Instagram Post'
+  ELSE 'Unknown' END AS campaign_type,
+FROM full_data_flat AS a
+ LEFT JOIN aff_ids AS b
+  ON a.tracked_platform = b.platform
+  AND campaign_id = publisher_id
+   )
+
+-- final query
+SELECT * FROM add_campaign_type
+

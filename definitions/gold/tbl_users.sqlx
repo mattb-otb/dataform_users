@@ -12,6 +12,7 @@ config {
         date: "Start date of the session.",
         brand: "Brand. On The Beach, Sunshine and On The Beach IE.",
         primary_user_id: "Best User ID from Bloomreach and GA4.", 
+        primary_user_id_source: "Best User ID type, from Bloomreach and GA4.", 
         user_ids: "All known user IDs and Order Codes.", 
         session: "Session level data, including session IDs",
         channel: "Top in day session channels",
@@ -28,30 +29,30 @@ js {var{get_cohort_name} = require("includes/cohorts_udf");}
 WITH
 replace_cohorts_with_names AS (
 SELECT
-    * EXCEPT(cohort, previous_cohort, last_daily_cohort, first_daily_cohort, last_daily_cohort_prev_day, top_daily_cohort),
-     ${get_cohort_name("cohort")} AS cohort,
-     ${get_cohort_name("previous_cohort")} AS previous_cohort,
-     ${get_cohort_name("last_daily_cohort")} AS last_daily_cohort,
-     ${get_cohort_name("first_daily_cohort")} AS first_daily_cohort,
-     ${get_cohort_name("last_daily_cohort_prev_day")} AS last_daily_cohort_prev_day,
-     ${get_cohort_name("top_daily_cohort")} AS top_daily_cohort,
+  * EXCEPT(cohort, previous_cohort, last_daily_cohort, first_daily_cohort, prev_top_daily_cohort, top_daily_cohort),
+  ${get_cohort_name("cohort")} AS cohort,
+  ${get_cohort_name("previous_cohort")} AS previous_cohort,
+  ${get_cohort_name("last_daily_cohort")} AS last_daily_cohort,
+  ${get_cohort_name("first_daily_cohort")} AS first_daily_cohort,
+  ${get_cohort_name("top_daily_cohort")} AS top_daily_cohort,
+  ${get_cohort_name("prev_top_daily_cohort")} AS previous_top_daily_cohort,
 FROM ${ref("stg_cohorts")}  
 ),
 
 join_multi_touch_attribution_date AS (
 SELECT 
-    a.*,
-    b.order_date,
-    b.redistributed_orders_ushaped,
-    b.redistributed_orders_pageviews,
-    b.redistributed_orders_linear,
-    b.redistributed_orders_combo,
-    b.redistributed_revenue_ushaped,
-    b.redistributed_revenue_pageviews,
-    b.redistributed_revenue_linear,
-    b.redistributed_revenue_combo,
-    b.day_number_in_order_window,
-    b.day_before_order 
+  a.*,
+  b.order_date,
+  b.redistributed_orders_ushaped,
+  b.redistributed_orders_pageviews,
+  b.redistributed_orders_linear,
+  b.redistributed_orders_combo,
+  b.redistributed_revenue_ushaped,
+  b.redistributed_revenue_pageviews,
+  b.redistributed_revenue_linear,
+  b.redistributed_revenue_combo,
+  b.day_number_in_order_window,
+  b.day_before_order 
 FROM replace_cohorts_with_names AS a
 LEFT JOIN ${ref("stg_attribution")} AS b
     ON a.session_id = b.session_id
@@ -59,9 +60,9 @@ LEFT JOIN ${ref("stg_attribution")} AS b
 
 join_mwi_data AS (
 SELECT 
-    a.*,
-    b.mwi_buying_stage_label,
-    b.mwi_momentum_label,
+  a.*,
+  b.mwi_buying_stage_label,
+  b.mwi_momentum_label,
 FROM join_multi_touch_attribution_date AS a
 LEFT JOIN ${ref("stg_mwi_sessions")} AS b
     ON a.session_id = b.device_session_id
@@ -69,16 +70,18 @@ LEFT JOIN ${ref("stg_mwi_sessions")} AS b
 
 -- arrange columns and shit like that
 arrange_columns AS (
-  SELECT 
+SELECT 
   date,
   'On The Beach' AS brand,
   best_id AS primary_user_id,
   CASE
+    WHEN best_id = master_contact_details_id THEN 'master_contact_details_id'
     WHEN best_id = bloomreach_id THEN 'bloomreach_id'
     WHEN best_id = user_id THEN 'user_id'
     WHEN best_id = user_pseudo_id THEN 'device_id'
   END AS primary_user_id_source,
   STRUCT(
+      master_contact_details_id AS master_contact_details_id,
       user_id AS user_id,
       user_pseudo_id AS device_id,
       bloomreach_id AS bloomreach_id,
@@ -109,31 +112,34 @@ arrange_columns AS (
       cohort,
       cohort_change_window,
       CASE 
-        WHEN first_visit_events = 1 THEN '0. Unknown'
-        WHEN previous_cohort IS NULL THEN cohort
+        WHEN previous_cohort IS NULL THEN '0. Unknown'
       ELSE previous_cohort END AS previous_cohort,
       first_daily_cohort,
       last_daily_cohort,
-      last_daily_cohort_prev_day,
       top_daily_cohort,
+      previous_top_daily_cohort,
       cohort_duration_days,
-      cohort_shift,
+      cohort_shift AS cohort_shift_score,
       mwi_buying_stage_label AS mwi_buying_stage_label,
       mwi_momentum_label AS mwi_momentum_label
     ) AS cohort,
   STRUCT(
       first_daily_channel,
       last_daily_channel,
-      CASE WHEN previous_last_daily_channel IS NULL THEN 'Unknown' ELSE previous_last_daily_channel END AS last_daily_channel_prev_day,
+      CASE WHEN previous_last_daily_channel IS NULL THEN 'Unknown' ELSE previous_last_daily_channel END AS previous_last_daily_channel,
       top_daily_channel_push AS top_daily_channel_pusher,
       top_daily_channel_retreat AS top_daily_channel_retreater
     ) AS channel,
   STRUCT(
       purchaser,
-      repeat_purchaser,
-      repeat_purchaser_mi,
+      CASE 
+        WHEN repeat_purchaser_mi IS TRUE THEN TRUE
+        WHEN repeat_purchaser IS TRUE THEN TRUE
+        ELSE FALSE END AS repeat_purchase,
       total_order_count,
+      rolling_order_count,
       returned_home_5d_plus AS returned_home_5days_plus,
+      returned_home_5d_plus_new AS returned_home_5days_plus_rolling,
       purchased_last_30d AS purchased_last_30days,
       purchased_last_90d AS purchased_last_90days,
       purchased_last_12m AS purchased_last_365days,
