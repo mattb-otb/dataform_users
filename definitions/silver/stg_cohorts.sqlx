@@ -94,32 +94,55 @@ FROM join_daily_dormant_flag
 add_cohorts AS (
 SELECT 
   *,
-  CASE 
-  -- top purchaser flag
-    WHEN daily_purchase_flag IS TRUE AND top_customer_flag IS TRUE THEN 10
-    WHEN returned_home_5d_plus_new IS FALSE AND top_customer_flag IS TRUE THEN 10
-    WHEN returned_home_5d_plus_new IS TRUE AND engaged_flag IS FALSE AND top_customer_flag IS TRUE THEN 9
-    WHEN returned_home_5d_plus_new IS TRUE AND engaged_flag IS TRUE AND top_customer_flag IS TRUE THEN 10
-  -- prioritise MI repeat oder flag, even though it's not perfect
-    WHEN repeat_purchaser_mi IS TRUE AND daily_purchase_flag IS TRUE THEN 7
-    WHEN repeat_purchaser_mi IS TRUE AND purchaser IS FALSE AND engaged_flag IS TRUE THEN 8
-    WHEN repeat_purchaser_mi IS TRUE AND purchaser IS FALSE AND engaged_flag IS FALSE THEN 6
-    WHEN repeat_purchaser_mi IS TRUE AND purchaser IS TRUE AND returned_home_5d_plus_new IS FALSE THEN 7
-    WHEN repeat_purchaser_mi IS TRUE AND purchaser IS TRUE AND returned_home_5d_plus_new IS TRUE AND engaged_flag IS FALSE THEN 7
-    WHEN repeat_purchaser_mi IS TRUE AND purchaser IS TRUE AND returned_home_5d_plus_new IS TRUE AND engaged_flag IS TRUE THEN 8
-  -- tag new customers first
-    WHEN purchaser IS FALSE AND engaged_flag IS FALSE THEN 1
-    WHEN purchaser IS FALSE AND engaged_flag IS TRUE THEN 2
-    WHEN purchaser IS TRUE AND repeat_purchaser IS FALSE AND daily_purchase_flag IS TRUE THEN 4
-    WHEN purchaser IS TRUE AND repeat_purchaser IS FALSE AND returned_home_5d_plus_new IS FALSE THEN 4
-    WHEN purchaser IS TRUE AND repeat_purchaser IS FALSE AND returned_home_5d_plus_new IS TRUE AND engaged_flag IS FALSE THEN 3
-    WHEN purchaser IS TRUE AND repeat_purchaser IS FALSE AND returned_home_5d_plus_new IS TRUE AND engaged_flag IS TRUE THEN 5
-  -- tag repeat customers last that the mi flag didn't pick up  
-    WHEN repeat_purchaser IS TRUE AND daily_purchase_flag IS TRUE THEN 7   
-    WHEN repeat_purchaser IS TRUE AND returned_home_5d_plus_new IS FALSE THEN 7
-    WHEN repeat_purchaser IS TRUE AND returned_home_5d_plus_new IS TRUE AND engaged_flag IS FALSE THEN 6
-    WHEN repeat_purchaser IS TRUE AND returned_home_5d_plus_new IS TRUE AND engaged_flag IS TRUE THEN 8
-  ELSE 0 END AS cohort,
+CASE
+  -- Top purchaser logic
+  WHEN top_customer_flag THEN
+    CASE
+      WHEN daily_purchase_flag THEN 10
+      WHEN NOT returned_home_5d_plus_new THEN 10
+      WHEN returned_home_5d_plus_new AND NOT engaged_flag THEN 9
+      WHEN returned_home_5d_plus_new AND engaged_flag THEN 10
+    END
+
+  -- Repeat purchaser with MI flag
+  WHEN repeat_purchaser_mi THEN
+    CASE
+      WHEN daily_purchase_flag THEN 7
+      WHEN NOT purchaser AND engaged_flag THEN 8
+      WHEN NOT purchaser AND NOT engaged_flag THEN 6
+      WHEN purchaser AND NOT returned_home_5d_plus_new THEN 7
+      WHEN purchaser AND returned_home_5d_plus_new AND NOT engaged_flag THEN 6
+      WHEN purchaser AND returned_home_5d_plus_new AND engaged_flag THEN 8
+    END
+
+  -- New customers
+  WHEN NOT purchaser THEN
+    CASE
+      WHEN NOT engaged_flag THEN 1
+      WHEN engaged_flag THEN 2
+    END
+
+  -- First-time purchasers
+  WHEN purchaser AND NOT repeat_purchaser THEN
+    CASE
+      WHEN daily_purchase_flag THEN 4
+      WHEN NOT returned_home_5d_plus_new THEN 4
+      WHEN returned_home_5d_plus_new AND NOT engaged_flag THEN 3
+      WHEN returned_home_5d_plus_new AND engaged_flag THEN 5
+    END
+
+  -- Repeat purchasers not flagged by MI
+  WHEN repeat_purchaser THEN
+    CASE
+      WHEN daily_purchase_flag THEN 7
+      WHEN NOT returned_home_5d_plus_new THEN 7
+      WHEN returned_home_5d_plus_new AND NOT engaged_flag THEN 6
+      WHEN returned_home_5d_plus_new AND engaged_flag THEN 8
+    END
+
+  ELSE 0
+END AS cohort
+
 FROM add_multi_order_flag
 ),
 

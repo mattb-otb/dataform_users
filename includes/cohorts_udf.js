@@ -22,5 +22,5 @@ ELSE '0. Unknown' END
 };
 
 module.exports = {
-    get_cohort_name
+get_cohort_name
 }

@@ -115,7 +115,6 @@ SELECT
     WHEN order_window_bn = 0 THEN (SAFE_MULTIPLY(order_window_bn, (percentile_order_share_pageviews+percentile_order_share_ushape)/2))
     ELSE (SAFE_MULTIPLY(order_window_bn, (percentile_order_share_pageviews+percentile_order_share_linear)/2))
   END AS redistributed_orders_combo,
-
   SAFE_MULTIPLY(order_revenue_bn, percentile_order_share_ushape) AS redistributed_revenue_ushaped,
   SAFE_MULTIPLY(order_revenue_bn, percentile_order_share_pageviews) AS redistributed_revenue_pageviews,
   SAFE_MULTIPLY(order_revenue_bn, percentile_order_share_linear) AS redistributed_revenue_linear,
@@ -123,7 +122,6 @@ SELECT
     WHEN order_window_bn = 0 THEN (SAFE_MULTIPLY(order_revenue_bn, (percentile_order_share_pageviews+percentile_order_share_ushape)/2))
     ELSE (SAFE_MULTIPLY(order_revenue_bn, (percentile_order_share_pageviews+percentile_order_share_linear)/2))
   END AS redistributed_revenue_combo,
-
 FROM add_bignumeric_rownumber
 )
 
