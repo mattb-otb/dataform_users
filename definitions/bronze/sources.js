@@ -23,9 +23,9 @@ declare({
 
 // Bloomreach data
 declare({
-    database: constants.PROJECT_NAME,
-    schema: '01_user_mb',
-    name: 'bloomreach_ids',
+    database: 'genglandexponea',
+    schema: 'eng_ab0f28f6_09fa_11ee_9b32_fe39de13d504_views',
+    name: 'customers_external_ids',
     description: "BR data."
 });
 

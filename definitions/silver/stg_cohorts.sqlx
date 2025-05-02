@@ -92,7 +92,7 @@ FROM join_daily_dormant_flag
 
 -- add custom cohorts
 add_cohorts AS (
- SELECT 
+SELECT 
   *,
   CASE 
   -- top purchaser flag
@@ -120,7 +120,7 @@ add_cohorts AS (
     WHEN repeat_purchaser IS TRUE AND returned_home_5d_plus_new IS TRUE AND engaged_flag IS FALSE THEN 6
     WHEN repeat_purchaser IS TRUE AND returned_home_5d_plus_new IS TRUE AND engaged_flag IS TRUE THEN 8
   ELSE 0 END AS cohort,
- FROM add_multi_order_flag
+FROM add_multi_order_flag
 ),
 
 -- find previous cohort, with calculations for the dormant user type
@@ -223,29 +223,6 @@ SELECT
   FIRST_VALUE(cohort) OVER (PARTITION BY date, best_id ORDER BY session_timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS first_daily_cohort, 
   FROM add_last_daily_cohort
 ),
-
--- -- Join previous day's cohort back in - ISSUES!
--- distinct_prev_day_cohort AS ( 
--- SELECT 
---   date,
---   best_id,
---   session_id,
--- COALESCE((CASE
---     WHEN MAX(dormant_day_flag) IS TRUE THEN MIN(previous_cohort) OVER (PARTITION BY best_id, date)
---   END),
---   (LAG(last_daily_cohort) OVER (PARTITION BY best_id ORDER BY date))) AS last_daily_cohort_prev_day
--- FROM add_first_daily_cohort
--- GROUP BY date, best_id, session_id, previous_cohort, last_daily_cohort
--- ),
-
--- join_prev_day_cohort AS (
--- SELECT
---   a.*,
---   b.last_daily_cohort_prev_day
--- FROM add_first_daily_cohort AS a 
--- LEFT JOIN distinct_prev_day_cohort AS b
---   ON a.session_id = b.session_id
--- ),
 
 top_cohort AS (
 SELECT

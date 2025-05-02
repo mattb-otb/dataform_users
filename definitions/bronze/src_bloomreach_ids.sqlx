@@ -1,0 +1,18 @@
+config { 
+    type: "table",
+    schema: constants.DATAFORM_LV1,
+    description: "Stage for Bloomreach data.",
+    tags: ["daily-update", "bronze"],
+    bigquery: {
+        labels: {environment: "bronze"}
+    },
+}
+
+js {var{tracked_platform} = require("includes/tracked_platform");}
+
+
+-- Get Bloomreach IDs
+
+SELECT 
+*
+FROM ${ref("customers_external_ids")}

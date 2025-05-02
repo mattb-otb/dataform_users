@@ -16,7 +16,7 @@ bloomreach_ids AS (
 SELECT 
    MIN(internal_customer_id) AS internal_customer_id,
    LOWER(id_value) AS id_value
-FROM ${ref("bloomreach_ids")} 
+FROM ${ref("src_bloomreach_ids")} 
 GROUP BY ALL
 ),
 join_bloomreach_ids AS (
@@ -185,7 +185,7 @@ window_calculations AS (
     GROUP BY best_id
     ),
 
--- Join back to the main table, but only when the session timestamp is 5+ days after the last return date
+-- Join back to the main table, add flag for when the session timestamp is 5+ days after the last return date
 check_return_dates AS (
 SELECT 
   a.*, 
@@ -211,7 +211,7 @@ LEFT JOIN departure_date_array AS c
   ON a.best_id = c.best_id
 ),
 
--- add various daily channel calculations
+-- add first/last daily channel calculations
 first_last_daily_channel AS (
 SELECT * FROM (
   SELECT
@@ -226,7 +226,7 @@ SELECT * FROM (
 )
 WHERE rn = 1
 ),
-
+-- joain first/last daily channel 
 join_daily_channel AS (
 SELECT
   a.*,
@@ -238,6 +238,7 @@ LEFT JOIN first_last_daily_channel AS b
   AND a.date = b.date
 ),
 
+-- get and join previous daily channel
 get_prev_daily_channel AS (
 SELECT
   date,
@@ -247,7 +248,6 @@ SELECT
 FROM join_daily_channel
 GROUP BY date, best_id, last_daily_channel
 ),
-
 join_prev_channel AS (
 SELECT
   a.*,
