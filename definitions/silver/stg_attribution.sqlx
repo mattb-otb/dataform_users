@@ -72,7 +72,8 @@ SELECT
   MAX(order_count) OVER (PARTITION BY best_id, first_order_window) AS order_window,
   SUM(ranking) OVER (PARTITION BY best_id, first_order_window) AS rolling_count_ushape,
   SUM(pageviews) OVER (PARTITION BY best_id, first_order_window) AS rolling_count_pageviews,
-  SUM(rn3) OVER (PARTITION BY best_id, first_order_window) AS rolling_count_linear
+  SUM(rn3) OVER (PARTITION BY best_id, first_order_window) AS rolling_count_time_decay,
+  MAX(rn4) OVER (PARTITION BY best_id, first_order_window) AS rolling_count_linear
 FROM null_last_window
 ),
 
@@ -91,7 +92,11 @@ END AS percentile_order_share_ushape,
   END AS percentile_order_share_pageviews,
   CASE 
     WHEN order_window = 0 THEN NULL
-    ELSE SAFE_DIVIDE(SAFE_CAST(rn3 AS BIGNUMERIC), SAFE_CAST(rolling_count_linear AS BIGNUMERIC))
+    ELSE SAFE_DIVIDE(SAFE_CAST(rn3 AS BIGNUMERIC), SAFE_CAST(rolling_count_time_decay AS BIGNUMERIC))
+  END AS percentile_order_share_time_decay,
+    CASE 
+    WHEN order_window = 0 THEN NULL
+    ELSE SAFE_DIVIDE(SAFE_CAST(1 AS BIGNUMERIC), SAFE_CAST(rolling_count_linear AS BIGNUMERIC))
   END AS percentile_order_share_linear
 FROM add_rolling_counts
 ),
@@ -110,22 +115,27 @@ SELECT
   *, 
   SAFE_MULTIPLY(order_window_bn, percentile_order_share_ushape) AS redistributed_orders_ushaped,
   SAFE_MULTIPLY(order_window_bn, percentile_order_share_pageviews) AS redistributed_orders_pageviews,
+  SAFE_MULTIPLY(order_window_bn, percentile_order_share_time_decay) AS redistributed_orders_time_decay,
   SAFE_MULTIPLY(order_window_bn, percentile_order_share_linear) AS redistributed_orders_linear,
-  CASE 
-    WHEN order_window_bn = 0 THEN (SAFE_MULTIPLY(order_window_bn, (percentile_order_share_pageviews+percentile_order_share_ushape)/2))
-    ELSE (SAFE_MULTIPLY(order_window_bn, (percentile_order_share_pageviews+percentile_order_share_linear)/2))
-  END AS redistributed_orders_combo,
+  -- CASE 
+  --   WHEN order_window_bn = 0 THEN (SAFE_MULTIPLY(order_window_bn, (percentile_order_share_pageviews+percentile_order_share_ushape)/2))
+  --   ELSE (SAFE_MULTIPLY(order_window_bn, (percentile_order_share_pageviews+percentile_order_share_time_decay)/2))
+  -- END AS redistributed_orders_combo,
   SAFE_MULTIPLY(order_revenue_bn, percentile_order_share_ushape) AS redistributed_revenue_ushaped,
   SAFE_MULTIPLY(order_revenue_bn, percentile_order_share_pageviews) AS redistributed_revenue_pageviews,
+  SAFE_MULTIPLY(order_revenue_bn, percentile_order_share_time_decay) AS redistributed_revenue_time_decay,
   SAFE_MULTIPLY(order_revenue_bn, percentile_order_share_linear) AS redistributed_revenue_linear,
-  CASE 
-    WHEN order_window_bn = 0 THEN (SAFE_MULTIPLY(order_revenue_bn, (percentile_order_share_pageviews+percentile_order_share_ushape)/2))
-    ELSE (SAFE_MULTIPLY(order_revenue_bn, (percentile_order_share_pageviews+percentile_order_share_linear)/2))
-  END AS redistributed_revenue_combo,
+  -- CASE 
+  --   WHEN order_window_bn = 0 THEN (SAFE_MULTIPLY(order_revenue_bn, (percentile_order_share_pageviews+percentile_order_share_ushape)/2))
+  --   ELSE (SAFE_MULTIPLY(order_revenue_bn, (percentile_order_share_pageviews+percentile_order_share_time_decay)/2))
+  -- END AS redistributed_revenue_combo,
 FROM add_bignumeric_rownumber
-)
+),
 
-SELECT * EXCEPT(order_window_bn, order_revenue_bn, rn3, rn4),
+final AS (SELECT * EXCEPT(order_window_bn, order_revenue_bn, rn3, rn4),
 rn3 AS row_asc,
 rn4 AS row_desc
 FROM calculate_percentiles_final
+)
+
+SELECT * FROM final

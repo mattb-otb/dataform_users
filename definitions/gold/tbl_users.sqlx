@@ -5,7 +5,7 @@ config {
     tags: ["daily-update", "gold"],
     bigquery: {
         partitionBy: "date",
-         clusterBy: ["primary_user_id", "brand"],
+        clusterBy: ["primary_user_id", "brand"],
         labels: {environment: "gold"}
     },
     columns:{
@@ -26,7 +26,7 @@ config {
 
 js {var{get_cohort_name} = require("includes/cohorts_udf");}
 
-WITH
+WITH 
 replace_cohorts_with_names AS (
 SELECT
   * EXCEPT(cohort, previous_cohort, last_daily_cohort, first_daily_cohort, prev_top_daily_cohort, top_daily_cohort),
@@ -46,11 +46,11 @@ SELECT
   b.redistributed_orders_ushaped,
   b.redistributed_orders_pageviews,
   b.redistributed_orders_linear,
-  b.redistributed_orders_combo,
+  b.redistributed_orders_time_decay,
   b.redistributed_revenue_ushaped,
   b.redistributed_revenue_pageviews,
   b.redistributed_revenue_linear,
-  b.redistributed_revenue_combo,
+  b.redistributed_revenue_time_decay,
   b.day_number_in_order_window,
   b.day_before_order 
 FROM replace_cohorts_with_names AS a
@@ -148,7 +148,7 @@ SELECT
       has_engaged_session_last_365_days AS engaged_session_365days,
       has_engaged_crm_last_30_days AS engaged_crm_30days,
       has_engaged_crm_last_90_days AS engaged_crm_90days, 
-      has_engaged_crm_last_365_days AS engaged_crm_365days,
+      has_engaged_crm_last_365_days AS engaged_crm_365days, 
       return_dates,
       departure_dates,
       destination_country,
@@ -164,12 +164,12 @@ SELECT
         redistributed_orders_ushaped AS order_count_ushaped,
         redistributed_orders_pageviews AS order_count_pageview,
         redistributed_orders_linear AS order_count_linear,
-        redistributed_orders_combo AS order_count_hybrid,
+        redistributed_orders_time_decay AS order_count_time_decay,
         revenue,
         redistributed_revenue_ushaped AS revenue_ushaped,
         redistributed_revenue_pageviews AS revenue_pageview,
         redistributed_revenue_linear AS revenue_linear,
-        redistributed_revenue_combo AS revenue_hybrid
+        redistributed_revenue_time_decay AS revenue_time_decay
     ) AS order_attribution,
    STRUCT(  
     order_date, 
